@@ -1292,15 +1292,20 @@ class MacroRecorder(QDialog):
     # BTN_LEFT..BTN_TASK — the pointer buttons that also drive the UI.
     MOUSE_BUTTONS = set(range(0x110, 0x118))
 
-    def __init__(self, paths, parent=None, excluded="", initial=""):
+    def __init__(self, paths, parent=None, excluded="", initial="", single=False):
         super().__init__(parent)
-        self.setWindowTitle("Record macro")
+        # single=True captures one key or chord and closes — the common case,
+        # without making the user drive the whole macro screen for it.
+        self.single = single
+        self.setWindowTitle("Record a key" if single else "Record macro")
         self.paths = list(paths)
         self.steps = []            # {"keys": [names]} or {"wait": ms}
         self._devices = []
         self._held = {}            # code -> name, currently down
         self._chord = []           # names accumulated for the chord in progress
+        self._chord_started = None # when that chord began, for measuring the gap
         self._last_release = None
+        self._ui_click_at = 0.0   # when a click last landed on this dialog
 
         # Carry the existing macro in so recording appends to it instead of
         # starting from scratch. Start paused when there is something to keep.
@@ -1315,6 +1320,11 @@ class MacroRecorder(QDialog):
 
         layout = QVBoxLayout(self)
         intro = QLabel(
+            "Press the key you want this mapping to produce — or several together "
+            "for a chord. It is captured as soon as you let go.<br><br>"
+            "<i>Your keyboard keeps working normally, so avoid pressing "
+            "shortcuts.</i>"
+            if single else
             "Press the keys you want this mapping to produce — one after another, "
             "or several together for a chord. The pauses between them are recorded "
             "too.<br><br>Press <b>Stop</b> when you're done, then trim or retime any "
@@ -1364,7 +1374,8 @@ class MacroRecorder(QDialog):
         delete.setToolTip("Remove the selected step  (Delete)")
         delete.clicked.connect(self.delete_step)
         edit_row.addWidget(delete)
-        edit_row.addWidget(QLabel("Wait (ms):"))
+        wait_label = QLabel("Wait (ms):")
+        edit_row.addWidget(wait_label)
         self.wait_field = QLineEdit()
         self.wait_field.setPlaceholderText("select a wait step")
         self.wait_field.editingFinished.connect(self.retime_step)
@@ -1381,11 +1392,13 @@ class MacroRecorder(QDialog):
         self.fixed_delay_field.setFixedWidth(70)
         self.fixed_delay_field.setToolTip("Milliseconds")
         delay_row.addWidget(self.fixed_delay_field)
-        delay_row.addWidget(QLabel("ms"))
+        ms_label = QLabel("ms")
+        delay_row.addWidget(ms_label)
         delay_row.addStretch(1)
         layout.addLayout(delay_row)
 
-        layout.addWidget(QLabel("<b>Macro</b>"))
+        macro_label = QLabel("<b>Macro</b>")
+        layout.addWidget(macro_label)
         self.preview = QLineEdit(readOnly=True)
         self.preview.setFont(QFont("monospace"))
         layout.addWidget(self.preview)
@@ -1397,6 +1410,16 @@ class MacroRecorder(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
+        if single:
+            self.recording = True
+            for widget in (self.list, self.stop_button, delete, self.wait_field,
+                           self.fixed_delay_check, self.fixed_delay_field,
+                           wait_label, ms_label, macro_label, self.preview):
+                widget.hide()
+            buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Use this key")
+            buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(False)
+            self.status.setText(
+                "<b style='color:#d13438'>● listening</b> — press a key")
         if self.recording:
             self._open(paths)
         QApplication.instance().installEventFilter(self)
@@ -1469,39 +1492,59 @@ class MacroRecorder(QDialog):
         for event in events:
             if event.type != evdev.ecodes.EV_KEY:
                 continue
+            # A click that just operated this dialog's own UI.
+            if event.code in self.MOUSE_BUTTONS \
+                    and time.monotonic() - self._ui_click_at < 0.25:
+                self._held.pop(event.code, None)
+                continue
             name = key_name(event.code)
             if event.value == 1:
                 if not self._held:
-                    # First key of a new step — the gap since the last one is a wait.
-                    self._record_gap()
                     self._chord = []
+                    self._chord_started = time.monotonic()
                 self._held[event.code] = name
                 if name not in self._chord:
                     self._chord.append(name)
             elif event.value == 0:
                 self._held.pop(event.code, None)
                 if not self._held and self._chord:
+                    # The gap is only committed now, together with the step it
+                    # precedes. Recording it when the chord *started* left an
+                    # orphaned wait behind whenever the chord was later discarded
+                    # — which is exactly what a click on this dialog does.
+                    self._append_gap()
                     self.steps.append({"keys": list(self._chord),
                                        "at": time.monotonic()})
                     self._chord = []
                     self._last_release = time.monotonic()
                     self.refresh()
+                    if self.single:
+                        self.status.setText(
+                            "<b style='color:#2e7d32'>captured</b> "
+                            f"{self.result_text()}")
+                        # Give the release a moment to settle, then hand it back.
+                        QTimer.singleShot(120, self.accept)
+                        return
 
     def fixed_delay_ms(self):
         text = self.fixed_delay_field.text().strip()
         value = int(text) if text.isdigit() else 100
         return max(1, min(value, self.MAX_WAIT_MS))
 
-    def _record_gap(self):
-        """The pause before the step that's starting now."""
+    def _append_gap(self):
+        """The pause before the chord that has just completed.
+
+        Measured from the previous release to when this chord began, so holding
+        a key down doesn't count as part of the pause before it.
+        """
         if self.fixed_delay_check.isChecked():
             # Same pause every time, regardless of how long the user took.
             if self.steps and "wait" not in self.steps[-1]:
                 self.steps.append({"wait": self.fixed_delay_ms()})
             return
-        if self._last_release is None:
+        if self._last_release is None or self._chord_started is None:
             return
-        gap = int((time.monotonic() - self._last_release) * 1000)
+        gap = int((self._chord_started - self._last_release) * 1000)
         if self.MIN_WAIT_MS <= gap <= self.MAX_WAIT_MS:
             self.steps.append({"wait": gap})
 
@@ -1524,6 +1567,10 @@ class MacroRecorder(QDialog):
         self.update_recording_state()
 
     def update_recording_state(self):
+        if self.single:
+            self.status.setText(
+                "<b style='color:#d13438'>● listening</b> — press a key")
+            return
         self.stop_button.setText("Stop" if self.recording else "Start recording")
         self.stop_button.setToolTip(
             "Stop recording so the steps can be edited" if self.recording
@@ -1538,17 +1585,30 @@ class MacroRecorder(QDialog):
             self.status.setText(
                 "<b>■ not recording</b> — press <b>Start recording</b> to begin")
 
-    def stop(self):
-        # Clicking Stop is itself a click and will have been recorded, along
-        # with the pause before it — drop both.
-        if self.recording and self.steps:
-            last = self.steps[-1]
-            recent = time.monotonic() - last.get("at", 0) < 1.0
-            only_buttons = all(name.startswith("BTN_") for name in last.get("keys", []))
-            if recent and only_buttons and last.get("keys"):
+    def drop_trailing_ui_click(self):
+        """Remove a click on this dialog that slipped into the macro.
+
+        Belt and braces behind the event-filter suppression. It only fires when
+        the last step was created *by* the click that landed on this dialog —
+        the step's timestamp is after the moment Qt delivered that click — so a
+        click the user deliberately recorded a moment earlier is never eaten.
+        """
+        if not self.steps or not self._ui_click_at:
+            return
+        if time.monotonic() - self._ui_click_at > 1.5:
+            return
+        last = self.steps[-1]
+        keys = last.get("keys") or []
+        created_by_that_click = last.get("at", 0) >= self._ui_click_at
+        if created_by_that_click and keys \
+                and all(name.startswith("BTN_") for name in keys):
+            self.steps.pop()
+            if self.steps and "wait" in self.steps[-1]:
                 self.steps.pop()
-                if self.steps and "wait" in self.steps[-1]:
-                    self.steps.pop()
+
+    def stop(self):
+        if self.recording:
+            self.drop_trailing_ui_click()
         self.recording = False
         self._deadline.stop()
         self._release_devices()
@@ -1628,8 +1688,14 @@ class MacroRecorder(QDialog):
         types = event.Type
         if event.type() in (types.KeyPress, types.KeyRelease, types.ShortcutOverride):
             return True
-        # Mouse events are deliberately left alone: the buttons must keep
-        # working, and the click that presses Stop is stripped afterwards.
+        # Mouse events pass through so the buttons keep working — but note when
+        # one lands on this dialog, so the same physical click arriving from
+        # evdev a moment later isn't recorded as part of the macro. This covers
+        # every button (Stop, Use this macro, Delete step…), not just Stop.
+        if event.type() in (types.MouseButtonPress, types.MouseButtonRelease,
+                            types.MouseButtonDblClick):
+            if isinstance(obj, QWidget) and self.isAncestorOf(obj):
+                self._ui_click_at = time.monotonic()
         return super().eventFilter(obj, event)
 
     def closeEvent(self, event):
@@ -1646,6 +1712,11 @@ class MacroRecorder(QDialog):
         super().reject()
 
     def accept(self):
+        # "Use this macro" can be pressed while still recording, and that click
+        # would otherwise be the last thing in the macro.
+        if self.recording:
+            self.drop_trailing_ui_click()
+            self.recording = False
         self.close()
         super().accept()
 
@@ -1736,7 +1807,14 @@ class PresetEditor(QDialog):
         self.output_field = QLineEdit()
         self.output_field.textEdited.connect(lambda _t: self.pull_form())
         output_row.addWidget(self.output_field, 1)
-        self.record_output = QPushButton("Edit")
+        self.record_key = QPushButton("Single key")
+        self.record_key.setToolTip(
+            "Press one key (or a chord) and use it as the output — no macro "
+            "screen, no timing.")
+        self.record_key.clicked.connect(self.do_record_single_key)
+        output_row.addWidget(self.record_key)
+
+        self.record_output = QPushButton("Macro")
         self.record_output.setToolTip(
             "Open the macro editor: review the existing steps, then record more "
             "keys, chords and the pauses between them.")
@@ -1919,7 +1997,8 @@ class PresetEditor(QDialog):
         enabled = mapping is not None
         for widget in (self.input_field, self.output_field, self.record_input,
                        self.record_output, self.target_combo, self.type_combo,
-                       self.output_type, self.output_code, self.hold_check):
+                       self.output_type, self.output_code, self.hold_check,
+                       self.record_key):
             widget.setEnabled(enabled)
         if mapping is None:
             self.input_field.clear(); self.output_field.clear()
@@ -2127,6 +2206,30 @@ class PresetEditor(QDialog):
             self.list.item(self.list.currentRow()).setText(self.describe(mapping))
 
     @guard
+    def do_record_single_key(self):
+        """Capture one key or chord straight into the output."""
+        mapping = self.current()
+        if mapping is None:
+            return
+        try:
+            import evdev
+            sources = evdev.list_devices()
+        except ImportError:
+            sources = []
+
+        stop_injections()
+        time.sleep(0.2)
+        recorder = MacroRecorder(sources, parent=self, single=True)
+        if not recorder.exec():
+            return
+        text = recorder.result_text()
+        if not text:
+            return
+        self.output_field.setText(
+            build_output(text, self.hold_check.isChecked(), self.loop_delay_ms()))
+        self.pull_form()
+
+    @guard
     def do_record_output(self):
         mapping = self.current()
         if mapping is None:
@@ -2144,9 +2247,15 @@ class PresetEditor(QDialog):
         # Remapping is paused for the session, so devices report their raw keys.
         stop_injections()
         time.sleep(0.2)   # let the daemon drop any grab before we start reading
-        # Strip the loop delay first: it's re-applied afterwards, and leaving it
-        # in would come back as an extra step and then get appended again.
-        base, _delay = split_trailing_wait(unwrap_hold(self.output_field.text()))
+        # A trailing wait only belongs to the loop delay when the output is a
+        # hold(...) — then it is re-applied on the way back, so leaving it in
+        # would return as an extra step and be appended twice. Without hold it
+        # is an ordinary part of the macro and must stay visible in the editor.
+        current = self.output_field.text()
+        if is_held(current):
+            base, _delay = split_trailing_wait(unwrap_hold(current))
+        else:
+            base = current
         recorder = MacroRecorder(sources, parent=self, initial=base)
         accepted = recorder.exec()
         if not accepted:
