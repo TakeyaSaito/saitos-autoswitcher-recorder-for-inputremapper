@@ -1,0 +1,27 @@
+name: Idea or request
+description: Suggest something that would make this more useful
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This started as a personal script to fill gaps left by moving from
+        Windows, so suggestions along those lines are especially welcome.
+
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would you like it to do?
+      placeholder: |
+        Being able to switch presets based on the focused window rather than
+        the running process, so two games open at once behave sensibly.
+    validations:
+      required: true
+
+  - type: textarea
+    id: why
+    attributes:
+      label: What are you trying to achieve?
+      description: The underlying problem, which sometimes has an easier solution than the feature itself.
+    validations:
+      required: false

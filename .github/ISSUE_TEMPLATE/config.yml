@@ -1,0 +1,10 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Input Remapper itself
+    url: https://github.com/sezanzeb/input-remapper/issues
+    about: >-
+      For problems with remapping, injection or presets in general. This project
+      only adds automatic switching and macro recording on top of it.
+  - name: Setup and usage
+    url: https://github.com/TakeyaSaito/saitos-autoswitcher-recorder-for-inputremapper#readme
+    about: Installation, the config format, and known quirks are covered in the README.

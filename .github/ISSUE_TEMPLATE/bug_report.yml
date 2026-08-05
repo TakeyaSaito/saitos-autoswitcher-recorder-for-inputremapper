@@ -1,0 +1,82 @@
+name: Bug report
+description: Something does not work, or behaves unexpectedly
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report this.
+
+        It has only been tested on a small number of setups, so problems on
+        other distros, desktops and devices are expected — no report is too
+        small, and "this was confusing" is worth filing too.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which part?
+      options:
+        - The switcher (presets not changing when a game starts)
+        - The GUI (mappings list, devices, saving)
+        - The preset editor (recording keys, macros, loop if held)
+        - Fix profile assignments
+        - The installer or uninstaller
+        - Something else / not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you expected, and what happened instead.
+      placeholder: |
+        I expected the Palworld preset to be applied when the game started,
+        but the keypad stayed on Default.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: How can it be reproduced?
+      placeholder: |
+        1. Open the GUI
+        2. Add a mapping from the Steam library
+        3. Launch the game
+    validations:
+      required: false
+
+  - type: textarea
+    id: paths
+    attributes:
+      label: Output of `input-remapper-autoswitch paths`
+      description: Shows every path and setting in effect. This answers most questions on its own.
+      render: text
+    validations:
+      required: false
+
+  - type: textarea
+    id: log
+    attributes:
+      label: Output of `journalctl --user -u input-remapper-autoswitch -n 50`
+      description: What the switcher actually did. Trim anything you would rather not share.
+      render: text
+    validations:
+      required: false
+
+  - type: input
+    id: system
+    attributes:
+      label: Distro, desktop and Input Remapper version
+      placeholder: "Fedora 42, GNOME 48 (Wayland), input-remapper 2.2.1"
+    validations:
+      required: true
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Device names, a screenshot, the preset that misbehaves — whatever seems relevant.
+    validations:
+      required: false
