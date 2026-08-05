@@ -329,6 +329,22 @@ The installer detects Arch, Debian/Ubuntu, Fedora and openSUSE for its dependenc
 hints and otherwise falls back to generic advice. Reports from other setups —
 especially other desktops and Input Remapper 1.x — are welcome.
 
+## Reporting issues
+
+It works on our setup — but that is one distro, one desktop and a handful of
+devices, so there are bound to be cases we have not run into. If something does
+not work, please open an issue and we will try to fix it.
+
+What helps most:
+
+- `input-remapper-autoswitch paths` — every path and setting in effect
+- `journalctl --user -u input-remapper-autoswitch -n 50` — what the switcher did
+- your distro, desktop environment and Input Remapper version
+- what you expected, and what happened instead
+
+Nothing is too small to report. If something was confusing rather than broken,
+that is worth knowing too.
+
 ## License
 
 MIT — see [LICENSE](LICENSE). Copyright © 2026 Takeya Saito.
