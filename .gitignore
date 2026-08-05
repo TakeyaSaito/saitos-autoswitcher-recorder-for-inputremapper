@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# A user's own configuration — config.example.txt is the one that ships
+config.txt
+config.txt.bak
+settings.conf
+
+# Editor / OS noise
+*.swp
+.DS_Store

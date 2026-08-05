@@ -1,0 +1,26 @@
+# Saito's AutoSwitcher/Recorder for Input Remapper — example configuration
+#
+#   process_name_or_unique_fragment | device name | preset name (without .json)
+#
+# * The process fragment is matched against the full command line with
+#   `pgrep -fi`, so a distinctive substring is enough. Case-insensitive.
+# * The device name must match Input Remapper exactly — run
+#   `input-remapper-control --list-devices`, or pick it from the GUI.
+# * The preset name is the file in
+#   ~/.config/input-remapper-2/presets/<device>/ without the .json.
+#
+# Rules are checked top to bottom and the first running process wins, per
+# device. DEFAULT applies to a device when nothing else matches; each device
+# gets its own.
+#
+# Copy this to config.txt (or let install.sh do it) and edit to taste.
+
+# Razer Razer Tartarus V2
+Palworld-Win64-Shipping.exe|Razer Razer Tartarus V2|Palworld
+tModLoader|Razer Razer Tartarus V2|Terraria
+# fallback when nothing above is running:
+DEFAULT|Razer Razer Tartarus V2|Default
+
+# A second device is configured the same way and switches independently.
+# Razer Razer Naga Trinity
+DEFAULT|Razer Razer Naga Trinity|Default
