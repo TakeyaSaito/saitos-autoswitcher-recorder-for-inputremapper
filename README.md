@@ -18,6 +18,22 @@ libraries, and repairing presets broken by a stale device ID.
 
 ![Config GUI](docs/screenshot.png)
 
+## Why this exists
+
+This was one of my frustrations when I switched to Linux: there was no software
+that covered everything Razer Synapse did. Input Remapper came close, but it was
+missing automatic switching and macro recording for ease of use.
+
+I gradually started tinkering to bridge that gap for myself. After a lot of
+testing it is in a decent enough state that others might find it useful, so I
+decided to make it available. It began as just my own switching script — it
+worked, but it was not in a good state for anyone else to use — and Claude Code
+was used as a helper to fix a lot of things and get it to where it is now.
+
+This is in no way affiliated with Input Remapper; it is just something I started
+to fit my own needs. But if it stops someone having to switch back to Windows
+over gaps like this, then great.
+
 ## What it does
 
 A small shell loop checks the process list every few seconds. For **each device
