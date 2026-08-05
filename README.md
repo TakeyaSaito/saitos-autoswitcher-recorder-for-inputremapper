@@ -276,7 +276,7 @@ needs — so it can't silently move mappings onto the wrong sub-device of a
 multi-node peripheral. Nothing else in the file is touched, and originals are
 copied to `preset-backups/` first.
 
-## Notes and gotchas
+## Notes
 
 - **Input Remapper must be reachable.** On 2.x an active session can talk to the
   daemon directly. If yours can't, `sudo systemctl enable --now
