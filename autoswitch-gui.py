@@ -2671,7 +2671,8 @@ class FixAssignmentsDialog(QDialog):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(f"{DISPLAY_NAME} — {CONFIG_FILE}")
+        self.setWindowTitle(DISPLAY_NAME)
+        self.setToolTip(f"Editing {CONFIG_FILE}")
         # Opens at the smallest size the layout allows (log collapsed); the
         # table keeps enough height to be usable, and it's freely resizable.
         self.devices = known_devices()
@@ -3532,7 +3533,7 @@ class MainWindow(QMainWindow):
         resolved = resolve_config_file(config_from_argv(sys.argv[1:]))
         if resolved != CONFIG_FILE:
             CONFIG_FILE = resolved
-            self.setWindowTitle(f"{DISPLAY_NAME} — {CONFIG_FILE}")
+            self.setWindowTitle(DISPLAY_NAME)
             self.status.showMessage(f"Now using {CONFIG_FILE}", 15000)
         self.load_config()
         self.warn_about_other_configs()
@@ -3761,7 +3762,9 @@ def main():
         return
     app = QApplication(sys.argv)
     app.setApplicationName(DISPLAY_NAME)
-    app.setApplicationDisplayName(DISPLAY_NAME)
+    # Qt appends applicationDisplayName to every window title, and it defaults to
+    # applicationName — so leaving it set repeats the name in the title bar.
+    app.setApplicationDisplayName("")
     apply_app_icon(app)
     window = MainWindow()
     window.show()
