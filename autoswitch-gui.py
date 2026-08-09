@@ -301,6 +301,40 @@ def save_gui_state(updates):
         pass
 
 
+# Extensions and engine suffixes that are part of the executable name but not
+# of the game's name — "Palworld-Win64-Shipping.exe" is a Palworld preset.
+PROCESS_NOISE_RE = re.compile(
+    r"(-(Win64|WinGDK|Win32)-Shipping)?"
+    r"(\.(exe|x86_64|x86|bin|sh|jar|AppImage|bin\.x86_64))?$", re.I)
+
+
+def clean_process_name(process):
+    """A likely preset name for a process: 'Palworld-Win64-Shipping.exe' -> 'Palworld'."""
+    name = (process or "").strip()
+    previous = None
+    while name and name != previous:          # strip .bin.x86_64 and friends
+        previous = name
+        name = PROCESS_NOISE_RE.sub("", name).strip()
+    return name or (process or "").strip()
+
+
+def preset_for_process(device, process):
+    """Which preset a new mapping for this process should point at.
+
+    Matches an existing preset by name where one fits, otherwise seeds the
+    process's own name so the row flags itself until the preset is created —
+    the same behaviour as importing from Steam. Picking whatever sorted first
+    silently attached games to an unrelated preset.
+    """
+    presets = presets_for(device)
+    if not process:
+        return DEFAULT_PRESET if DEFAULT_PRESET in presets else (
+            presets[0] if presets else "")
+    guess = clean_process_name(process)
+    by_norm = {normalize(name): name for name in presets}
+    return by_norm.get(normalize(guess), safe_preset_name(guess))
+
+
 def normalize(text):
     return re.sub(r"[^a-z0-9]", "", text.lower())
 
@@ -2924,10 +2958,22 @@ class MainWindow(QMainWindow):
         # Keep DEFAULT at the bottom where it reads as the fallback.
         r = min(self.current_row() + 1, self.default_row_index()) \
             if self.table.rowCount() else 0
-        presets = presets_for(device)
-        self.insert_row(r, proc or "", device, presets[0] if presets else "")
+        preset = preset_for_process(device, proc)
+        self.insert_row(r, proc or "", device, preset)
         self.table.setCurrentCell(r, 0)
         self.mark_dirty()
+
+        # Named a preset that doesn't exist yet? Create it from Default, the same
+        # as importing from Steam does — otherwise the row is added already
+        # broken and the preset has to be made by hand.
+        if proc and preset and not preset_exists(device, preset):
+            ok, message = create_preset_from_default(device, preset)
+            self.refresh_preset_lists()
+            self.table.setCurrentCell(r, 0)
+            self.status.showMessage(
+                f"Added “{proc}” — {message}" if ok else
+                f"Added “{proc}” — preset “{preset}” still needs creating ({message})",
+                15000)
 
     def add_from_process(self):
         dialog = ProcessPicker(self)
