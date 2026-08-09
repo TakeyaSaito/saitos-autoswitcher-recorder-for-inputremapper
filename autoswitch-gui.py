@@ -1774,21 +1774,16 @@ class PresetEditor(QDialog):
         self.loading = False
         self.manual_targets = set()
 
-        # Nothing should be remapping the hardware while it's being mapped: a
-        # game starting mid-edit would re-grab the device and recordings would
-        # come through already translated. Held for the whole session rather
-        # than per-recording, so profiles don't flicker back between takes.
-        self.switcher_was_up = (
-            systemctl("is-active", SERVICE, check_output=True) == "active")
-        if self.switcher_was_up:
-            systemctl("stop", SERVICE)
-        stop_injections()
+        # Remapping is paused only while actually recording — see
+        # pause_for_recording(). Leaving it running the rest of the time means
+        # the preset can be tried out without closing the editor.
+        self.switcher_was_up = False
 
         layout = QVBoxLayout(self)
         paused = QLabel(
-            "<span style='color:#c07000'>⏸ Remapping is paused while this window "
-            "is open — your devices behave normally, and profiles resume when you "
-            "close it.</span>")
+            "<span style='color:#c07000'>⏸ Remapping pauses only while you're "
+            "recording a key or macro, so the rest of the time you can try the "
+            "preset out with this window open.</span>")
         paused.setWordWrap(True)
         layout.addWidget(paused)
         if not self.api:
@@ -1953,8 +1948,15 @@ class PresetEditor(QDialog):
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save
                                    | QDialogButtonBox.StandardButton.Close)
-        buttons.button(QDialogButtonBox.StandardButton.Save).setText("Save && apply")
-        buttons.accepted.connect(self.save)
+        buttons.button(QDialogButtonBox.StandardButton.Save).setText(
+            "Save/Apply && Close")
+        keep_open = buttons.addButton("Save && Apply",
+                                      QDialogButtonBox.ButtonRole.ApplyRole)
+        keep_open.setToolTip(
+            "Write the preset and apply it, then carry on editing. Remapping "
+            "stays paused while this window is open.")
+        keep_open.clicked.connect(lambda: self.save(close_after=False))
+        buttons.accepted.connect(lambda: self.save(close_after=True))
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
@@ -2205,9 +2207,7 @@ class PresetEditor(QDialog):
                                 f"“{self.device}” isn't connected right now.")
             return
 
-        # Remapping is already paused for the whole editor session; just make
-        # sure nothing has re-grabbed the device since.
-        stop_injections()
+        self.pause_for_recording()
         try:
             recorder = Recorder(
                 [path for path, _h in nodes], "Record input",
@@ -2218,7 +2218,7 @@ class PresetEditor(QDialog):
                 combination=True, parent=self)
             accepted = recorder.exec()
         finally:
-            pass
+            self.resume_remapping()
 
         if accepted and recorder.result_keys:
             configs = [self.api["InputConfig"](type=t, code=c, origin_hash=h)
@@ -2251,10 +2251,13 @@ class PresetEditor(QDialog):
         except ImportError:
             sources = []
 
-        stop_injections()
-        time.sleep(0.2)
-        recorder = MacroRecorder(sources, parent=self, single=True)
-        if not recorder.exec():
+        self.pause_for_recording()
+        try:
+            recorder = MacroRecorder(sources, parent=self, single=True)
+            accepted = recorder.exec()
+        finally:
+            self.resume_remapping()
+        if not accepted:
             return
         text = recorder.result_text()
         if not text:
@@ -2278,9 +2281,6 @@ class PresetEditor(QDialog):
         except ImportError:
             sources = []
 
-        # Remapping is paused for the session, so devices report their raw keys.
-        stop_injections()
-        time.sleep(0.2)   # let the daemon drop any grab before we start reading
         # A trailing wait only belongs to the loop delay when the output is a
         # hold(...) — then it is re-applied on the way back, so leaving it in
         # would return as an extra step and be appended twice. Without hold it
@@ -2290,8 +2290,13 @@ class PresetEditor(QDialog):
             base, _delay = split_trailing_wait(unwrap_hold(current))
         else:
             base = current
-        recorder = MacroRecorder(sources, parent=self, initial=base)
-        accepted = recorder.exec()
+
+        self.pause_for_recording()
+        try:
+            recorder = MacroRecorder(sources, parent=self, initial=base)
+            accepted = recorder.exec()
+        finally:
+            self.resume_remapping()
         if not accepted:
             return
         text = recorder.result_text()
@@ -2339,6 +2344,21 @@ class PresetEditor(QDialog):
         del self.mappings[row]
         self.refresh_list(select=max(0, row - 1))
 
+    def pause_for_recording(self):
+        """Stop remapping for the duration of a recording.
+
+        A device with an active preset has its node grabbed, so its keys would
+        arrive already translated — press "1" on a mapped keypad and you would
+        record whatever it currently emits. The switcher has to stop too, since
+        it re-applies the profile every few seconds.
+        """
+        self.switcher_was_up = (
+            systemctl("is-active", SERVICE, check_output=True) == "active")
+        if self.switcher_was_up:
+            systemctl("stop", SERVICE)
+        stop_injections()
+        time.sleep(0.2)   # let the daemon drop its grabs before we read
+
     def resume_remapping(self):
         """Start the switcher again — whatever way this window was dismissed.
 
@@ -2362,7 +2382,7 @@ class PresetEditor(QDialog):
         super().accept()
 
     @guard
-    def save(self):
+    def save(self, close_after=True):
         path = PRESET_DIR / self.device / f"{self.preset_name}.json"
         invalid = [m for m in self.mappings if not m.is_valid()]
         if invalid:
@@ -2432,15 +2452,26 @@ class PresetEditor(QDialog):
                 "These inputs are mapped more than once; only the first was kept:\n\n"
                 + "\n".join(f"  • {d}" for d in duplicates))
 
-        # Bring the switcher back before reloading, so the reload sees it running
-        # and restarts it — which is what re-applies the freshly saved preset.
-        self.resume_remapping()
         parent = self.parent()
         note = parent.run_reload() if hasattr(parent, "run_reload") else ""
-        QMessageBox.information(
-            self, "Saved",
-            f"“{self.preset_name}” saved.\n\n{note}" if note else "Saved.")
-        self.accept()
+
+        if close_after:
+            QMessageBox.information(
+                self, "Saved",
+                f"“{self.preset_name}” saved.\n\n{note}" if note else "Saved.")
+            self.accept()
+            return
+
+        # Staying open: reload the preset so the list reflects what is now on
+        # disk rather than drifting from it. Remapping stays running, so the
+        # change can be tried out straight away.
+        row = self.list.currentRow()
+        self.preset_changed(self.preset_name)
+        if 0 <= row < self.list.count():
+            self.list.setCurrentRow(row)
+        self.error_label.setText(
+            f"<span style='color:#2e7d32'>✓ saved “{self.preset_name}” — "
+            "carry on editing</span>")
 
 
 class NoScrollComboBox(QComboBox):
