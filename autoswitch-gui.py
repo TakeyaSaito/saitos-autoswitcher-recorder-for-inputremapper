@@ -11,6 +11,7 @@ import inspect
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -656,6 +657,70 @@ def clear_squatters():
     return pids, ""
 
 
+REMAPPER_BUS_NAME = "inputremapper.Control"
+
+
+NAME_HAS_OWNER = ["busctl", "--system", "call", "org.freedesktop.DBus",
+                  "/org/freedesktop/DBus", "org.freedesktop.DBus",
+                  "NameHasOwner", "s", REMAPPER_BUS_NAME]
+
+
+def bus_name_free():
+    """True when nothing owns Input Remapper's D-Bus name.
+
+    Asks dbus directly. `busctl status` looks like it would do, but its exit
+    code does not distinguish "no such name" from other failures, so it reads as
+    free even while the name is held.
+    """
+    try:
+        res = subprocess.run(NAME_HAS_OWNER, capture_output=True, text=True,
+                             timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return True  # can't tell, so don't hold the restart up over it
+    if res.returncode != 0:
+        return True
+    return "true" not in res.stdout
+
+
+def restart_remapper_service():
+    """Stop Input Remapper, wait for its D-Bus name to be free, then start it.
+
+    `systemctl restart` launches the new daemon a couple of milliseconds after
+    the old one exits — before dbus has processed the old owner disconnecting.
+    The new daemon then loses the race for `inputremapper.Control`, logs "Is the
+    service already running?" and exits 9, leaving the unit dead:
+
+        15:11:04.341  Deactivated successfully
+        15:11:04.343  Starting ...
+        15:11:04.541  ERROR: Is the service already running?
+        15:11:04.590  Main process exited, status=9/n/a
+
+    Doing the stop and the start as separate steps, with a wait in between for
+    the name to actually be released, makes it deterministic. Returns
+    (code, output, how) exactly like run_privileged.
+    """
+    stop = ["systemctl", "stop", REMAPPER_SERVICE]
+    start = ["systemctl", "start", REMAPPER_SERVICE]
+
+    if passwordless_sudo():
+        code, out, how = run_privileged(stop)
+        if code != 0:
+            return code, out, how
+        deadline = time.monotonic() + 3
+        while not bus_name_free() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        return run_privileged(start)
+
+    # Without passwordless sudo each escalation costs the user a password
+    # prompt, so run the whole sequence inside a single one.
+    script = (f"systemctl stop {REMAPPER_SERVICE}; "
+              f"i=0; while [ $i -lt 60 ] && "
+              f"{shlex.join(NAME_HAS_OWNER)} 2>/dev/null | grep -q true; do "
+              f"sleep 0.05; i=$((i+1)); done; "
+              f"exec systemctl start {REMAPPER_SERVICE}")
+    return run_privileged(["sh", "-c", script])
+
+
 def reload_remapper():
     """Restart Input Remapper so it sees new presets, then the switcher.
 
@@ -675,11 +740,10 @@ def reload_remapper():
     # restart can never strand a key in the down position.
     stop_injections()
 
-    restart = ["systemctl", "restart", REMAPPER_SERVICE]
-    code, out, how = run_privileged(restart)
+    code, out, how = restart_remapper_service()
     if code != 0 and how != "denied":
         time.sleep(1.5)  # give a lingering daemon time to drop the bus name
-        code, out, how = run_privileged(restart)
+        code, out, how = restart_remapper_service()
 
     # Still refusing to start? Something outside systemd owns the bus name —
     # typically a daemon orphaned by the Input Remapper GTK app. Restarting can
@@ -693,7 +757,7 @@ def reload_remapper():
         if killed:
             messages.append(f"cleared {len(killed)} orphaned daemon(s) holding the "
                             "D-Bus name")
-            code, out, how = run_privileged(restart)
+            code, out, how = restart_remapper_service()
 
     if code != 0 and how == "denied":
         messages.append("Input Remapper NOT restarted (authorization declined) — "
@@ -704,6 +768,9 @@ def reload_remapper():
                          check_output=True, system=True) == "active":
                 break
             time.sleep(0.25)
+        # A key held across the teardown loses its key-up with the old daemon's
+        # virtual keyboard, so make sure nothing is left down.
+        release_all_keys()
         messages.append("Input Remapper restarted")
     else:
         messages.append(f"Input Remapper restart FAILED: {out.splitlines()[0] if out else ''}")
@@ -1033,29 +1100,33 @@ class Recorder(QDialog):
             return
         from PyQt6.QtCore import QSocketNotifier
 
-        failed = []
-        for path in paths:
-            device = None
-            # The daemon may not have let go the instant we asked it to, so keep
-            # trying for a few seconds rather than silently skipping the one node
-            # that actually emits the keys.
-            for _attempt in range(12):
+        # The daemon may not have let go the instant we asked it to, so nodes that
+        # refuse are retried — but in rounds against one shared deadline, not one
+        # wait per node. A node that is permanently held by something else would
+        # otherwise put seconds between pressing Record and recording starting.
+        pending = list(paths)
+        deadline = time.monotonic() + 1.0
+        while True:
+            still = []
+            for path in pending:
+                device = None
                 try:
                     device = evdev.InputDevice(path)
                     device.grab()
-                    break
                 except OSError:
                     if device is not None:
                         device.close()
-                        device = None
-                    time.sleep(0.25)
-                    QApplication.processEvents()
-            if device is None:
-                failed.append(path)
-                continue
-            notifier = QSocketNotifier(device.fd, QSocketNotifier.Type.Read, self)
-            notifier.activated.connect(lambda _s, d=device: self._read(d))
-            self._devices.append((device, notifier))
+                    still.append(path)
+                    continue
+                notifier = QSocketNotifier(device.fd, QSocketNotifier.Type.Read, self)
+                notifier.activated.connect(lambda _s, d=device: self._read(d))
+                self._devices.append((device, notifier))
+            pending = still
+            if not pending or time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
+            QApplication.processEvents()
+        failed = pending
 
         if not self._devices:
             self.label.setText(
@@ -2357,7 +2428,9 @@ class PresetEditor(QDialog):
         if self.switcher_was_up:
             systemctl("stop", SERVICE)
         stop_injections()
-        time.sleep(0.2)   # let the daemon drop its grabs before we read
+        # No sleep here on purpose — the recorder retries its grabs for a second,
+        # so it starts as soon as the daemon has actually let go instead of
+        # always paying a fixed wait.
 
     def resume_remapping(self):
         """Start the switcher again — whatever way this window was dismissed.
