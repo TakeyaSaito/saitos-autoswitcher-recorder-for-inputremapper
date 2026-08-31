@@ -22,7 +22,8 @@ from PyQt6.QtCore import Qt, QEventLoop, QProcess, QTimer
 from PyQt6.QtGui import (QBrush, QColor, QFont, QIcon, QKeySequence,
                          QShortcut)
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
+    QAbstractButton, QAbstractItemView, QAbstractSpinBox,
+    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QInputDialog,
     QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
     QListWidget, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QPushButton,
@@ -1799,9 +1800,33 @@ class MacroRecorder(QDialog):
         # every button (Stop, Use this macro, Delete step…), not just Stop.
         if event.type() in (types.MouseButtonPress, types.MouseButtonRelease,
                             types.MouseButtonDblClick):
-            if isinstance(obj, QWidget) and self.isAncestorOf(obj):
+            if not isinstance(obj, QWidget) or not self.isAncestorOf(obj):
+                return super().eventFilter(obj, event)   # not our window
+            if self.presses_a_button(obj):
                 self._ui_click_at = time.monotonic()
+                return super().eventFilter(obj, event)
+            # Anywhere else on this dialog: the click belongs in the macro, so
+            # let evdev record it and stop it reaching the widget underneath —
+            # nothing here is meant to be operated mid-recording anyway.
+            return True
         return super().eventFilter(obj, event)
+
+    def presses_a_button(self, obj):
+        """True when this click is operating one of the dialog's buttons.
+
+        Only buttons end or drive a recording (Stop, Cancel, Use this macro), so
+        only they suppress the click. Counting the step list and the wait field
+        as well is what stopped left and right click being recordable at all in
+        the macro window: its middle is the step list, so almost every click
+        landed on a "control", marked itself as UI, and was dropped. The
+        single-key window has no list, which is why it kept working.
+        """
+        widget = obj
+        while widget is not None and widget is not self:
+            if isinstance(widget, QAbstractButton):
+                return True
+            widget = widget.parentWidget()
+        return False
 
     def closeEvent(self, event):
         self.recording = False
