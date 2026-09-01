@@ -1222,6 +1222,16 @@ def detect_target(output_symbol=None, output_type=None, output_code=None):
         code = evdev.ecodes.ecodes.get(name)
         if code is not None:
             needed.add((evdev.ecodes.EV_KEY, code))
+    # Wheel steps name no KEY_/BTN_ symbol, so without this a scroll-only macro
+    # looks like it needs nothing and can be left on the keyboard target — which
+    # carries no EV_REL codes at all, so it would emit silently nothing.
+    for ev_name, code_name in re.findall(
+            r"\b(?:e|event)\(\s*(EV_[A-Z]+)\s*,\s*([A-Z0-9_]+)",
+            output_symbol or ""):
+        ev_type = evdev.ecodes.ecodes.get(ev_name)
+        code = evdev.ecodes.ecodes.get(code_name)
+        if ev_type is not None and code is not None:
+            needed.add((ev_type, code))
     if output_type is not None and output_code is not None:
         needed.add((output_type, output_code))
     if not needed:
@@ -1349,7 +1359,65 @@ def unwrap_hold(text):
     return text[len("hold("):-1].strip() if is_held(text) else text
 
 
-MACRO_STEP_RE = re.compile(r"(key|wait|hold_keys)\(([^)]*)\)")
+MACRO_STEP_RE = re.compile(r"(key_down|key_up|key|wait|hold_keys|event)\(([^)]*)\)")
+
+
+# A wheel notch has to be written twice, low-res and high-res.
+HI_RES_PARTNER = {"REL_WHEEL": "REL_WHEEL_HI_RES",
+                  "REL_HWHEEL": "REL_HWHEEL_HI_RES"}
+HI_RES_CODES = {v: k for k, v in HI_RES_PARTNER.items()}
+
+
+def scroll_direction(step):
+    """'up', 'down x3'… for a recorded wheel step."""
+    value = step["value"]
+    if step["scroll"] == "REL_HWHEEL":
+        word = "right" if value > 0 else "left"
+    else:
+        word = "up" if value > 0 else "down"
+    return word if abs(value) == 1 else f"{word} x{abs(value)}"
+
+
+def step_text(step):
+    """One recorded step as macro text."""
+    if "wait" in step:
+        return f"wait({step['wait']})"
+    if "down" in step:
+        return f"key_down({step['down']})"
+    if "up" in step:
+        return f"key_up({step['up']})"
+    if "scroll" in step:
+        # Both halves, exactly as Input Remapper's own wheel() does. The virtual
+        # mouse advertises hi-res support, and libinput ignores plain REL_WHEEL
+        # on any device that does — so the low-res event alone scrolls nothing.
+        # 120 hi-res units is one notch (kernel EV_REL documentation).
+        hires = HI_RES_PARTNER[step["scroll"]]
+        return (f"event(EV_REL, {step['scroll']}, {step['value']})"
+                f".event(EV_REL, {hires}, {step['value'] * 120})")
+    if len(step["keys"]) == 1:
+        return f"key({step['keys'][0]})"
+    return "hold_keys(" + ", ".join(step["keys"]) + ")"
+
+
+# A wheel notch written without its hi-res half, which scrolls nothing.
+LONE_WHEEL_RE = re.compile(
+    r"event\(\s*EV_REL\s*,\s*(REL_H?WHEEL)\s*,\s*(-?\d+)\s*\)"
+    r"(?!\s*\.\s*event\(\s*EV_REL\s*,\s*REL_H?WHEEL_HI_RES)")
+
+
+def upgrade_wheel_events(text):
+    """Add the hi-res half to wheel notches that were recorded without it.
+
+    Macros recorded before this was understood contain only
+    event(EV_REL, REL_WHEEL, n). libinput ignores the low-res event on any
+    device advertising hi-res support — which the virtual mouse does — so those
+    macros scroll nothing at all. Repairing them on load is strictly a fix.
+    """
+    return LONE_WHEEL_RE.sub(
+        lambda mm: (f"event(EV_REL, {mm.group(1)}, {mm.group(2)})"
+                    f".event(EV_REL, {HI_RES_PARTNER[mm.group(1)]}, "
+                    f"{int(mm.group(2)) * 120})"),
+        text or "")
 
 
 def parse_macro_steps(text):
@@ -1358,7 +1426,7 @@ def parse_macro_steps(text):
     Only round-trips what this recorder produces. Anything more elaborate is
     returned as None so the existing macro is left alone rather than mangled.
     """
-    text = (text or "").strip()
+    text = upgrade_wheel_events((text or "").strip()).strip()
     if not text:
         return []
     if re.fullmatch(r"[A-Za-z0-9_]+", text):      # a bare symbol like KEY_M
@@ -1371,6 +1439,33 @@ def parse_macro_steps(text):
             if not args.isdigit():
                 return None
             steps.append({"wait": int(args)})
+        elif name == "event":
+            # Only wheel notches — anything else built with event() is beyond
+            # what this recorder can show.
+            parts = [a.strip() for a in args.split(",")]
+            if len(parts) != 3 or parts[0] != "EV_REL":
+                return None
+            try:
+                value = int(parts[2])
+            except ValueError:
+                return None
+            if parts[1] in HI_RES_CODES:
+                # The high-res half of the notch before it: already represented
+                # by that step, so it is folded in rather than listed again.
+                previous = steps[-1] if steps else None
+                if not previous or previous.get("scroll") != HI_RES_CODES[parts[1]] \
+                        or previous["value"] * 120 != value:
+                    return None
+            elif parts[1] in HI_RES_PARTNER:
+                steps.append({"scroll": parts[1], "value": value})
+            else:
+                return None
+        elif name in ("key_down", "key_up"):
+            # A press or release on its own, from the separate press/release
+            # recording mode.
+            if not re.fullmatch(r"[A-Za-z0-9_]+", args):
+                return None
+            steps.append({"down" if name == "key_down" else "up": args})
         else:
             keys = [k.strip() for k in args.split(",") if k.strip()]
             if not keys or (name == "key" and len(keys) != 1):
@@ -1378,11 +1473,7 @@ def parse_macro_steps(text):
             steps.append({"keys": keys})
 
     # Only trust the parse if it reproduces the original exactly.
-    rebuilt = ".".join(
-        f"wait({s['wait']})" if "wait" in s
-        else (f"key({s['keys'][0]})" if len(s["keys"]) == 1
-              else "hold_keys(" + ", ".join(s["keys"]) + ")")
-        for s in steps)
+    rebuilt = ".".join(step_text(s) for s in steps)
     normalise = lambda t: re.sub(r"\s+", "", t)
     return steps if steps and normalise(rebuilt) == normalise(text) else None
 
@@ -1397,6 +1488,9 @@ class MacroRecorder(QDialog):
     MAX_WAIT_MS = 10_000
     # BTN_LEFT..BTN_TASK — the pointer buttons that also drive the UI.
     MOUSE_BUTTONS = set(range(0x110, 0x118))
+    # Wheel axes worth recording. The _HI_RES twins are deliberately absent:
+    # they fire alongside these for the same notch and would double every step.
+    WHEEL_CODES = {0x08: "REL_WHEEL", 0x06: "REL_HWHEEL"}
 
     def __init__(self, paths, parent=None, excluded="", initial="", single=False):
         super().__init__(parent)
@@ -1411,7 +1505,9 @@ class MacroRecorder(QDialog):
         self._chord = []           # names accumulated for the chord in progress
         self._chord_started = None # when that chord began, for measuring the gap
         self._last_release = None
+        self._last_event_at = None  # previous press *or* release, for separate mode
         self._ui_click_at = 0.0   # when a click last landed on this dialog
+        self._button_click_pending = False   # a button of this dialog was clicked
 
         # Carry the existing macro in so recording appends to it instead of
         # starting from scratch. Start paused when there is something to keep.
@@ -1503,6 +1599,19 @@ class MacroRecorder(QDialog):
         delay_row.addStretch(1)
         layout.addLayout(delay_row)
 
+        self.separate_check = QCheckBox("Record press and release as separate steps")
+        self.separate_check.setToolTip(
+            "Record key_down(...) and key_up(...) instead of a single key(...), so "
+            "a key can be held down across other steps — for a macro that holds "
+            "aim while it fires, say. The pause between the press and the release "
+            "is how long you held it.")
+        layout.addWidget(self.separate_check)
+
+        self.balance_warning = QLabel()
+        self.balance_warning.setWordWrap(True)
+        self.balance_warning.hide()
+        layout.addWidget(self.balance_warning)
+
         macro_label = QLabel("<b>Macro</b>")
         layout.addWidget(macro_label)
         self.preview = QLineEdit(readOnly=True)
@@ -1520,6 +1629,7 @@ class MacroRecorder(QDialog):
             self.recording = True
             for widget in (self.list, self.stop_button, delete, self.wait_field,
                            self.fixed_delay_check, self.fixed_delay_field,
+                           self.separate_check, self.balance_warning,
                            wait_label, ms_label, macro_label, self.preview):
                 widget.hide()
             buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Use this key")
@@ -1575,7 +1685,10 @@ class MacroRecorder(QDialog):
         for path in paths:
             try:
                 device = evdev.InputDevice(path)
-                if evdev.ecodes.EV_KEY not in device.capabilities():
+                caps = device.capabilities()
+                scrolls = any(code in self.WHEEL_CODES
+                              for code in caps.get(evdev.ecodes.EV_REL, []))
+                if evdev.ecodes.EV_KEY not in caps and not scrolls:
                     device.close()      # pointer-motion only; nothing to record
                     continue
             except OSError:
@@ -1596,6 +1709,9 @@ class MacroRecorder(QDialog):
         except OSError:
             return
         for event in events:
+            if event.type == evdev.ecodes.EV_REL:
+                self._read_scroll(event)
+                continue
             if event.type != evdev.ecodes.EV_KEY:
                 continue
             # A click that just operated this dialog's own UI.
@@ -1604,6 +1720,23 @@ class MacroRecorder(QDialog):
                 self._held.pop(event.code, None)
                 continue
             name = key_name(event.code)
+            if self.separate_steps():
+                # Each press and release is its own step, so a key can stay down
+                # across the steps that follow.
+                if event.value not in (0, 1):
+                    continue          # key repeat, not a new press
+                now = time.monotonic()
+                self._append_event_gap(now)
+                if event.value == 1:
+                    self._held[event.code] = name
+                    self.steps.append({"down": name, "at": now})
+                else:
+                    self._held.pop(event.code, None)
+                    self.steps.append({"up": name, "at": now})
+                self._last_event_at = now
+                self._last_release = now
+                self.refresh()
+                continue
             if event.value == 1:
                 if not self._held:
                     self._chord = []
@@ -1654,6 +1787,53 @@ class MacroRecorder(QDialog):
         if self.MIN_WAIT_MS <= gap <= self.MAX_WAIT_MS:
             self.steps.append({"wait": gap})
 
+    def _read_scroll(self, event):
+        """Record one wheel notch.
+
+        A notch is instantaneous — there is nothing to hold — so it stays a
+        single step even in separate press/release mode, which applies only to
+        keys and buttons. Pointer motion is ignored entirely.
+        """
+        name = self.WHEEL_CODES.get(event.code)
+        if not name or not event.value:
+            return
+        now = time.monotonic()
+        if self.separate_steps():
+            self._append_event_gap(now)
+            self._last_event_at = now
+        else:
+            self._chord_started = now      # the gap runs up to this notch
+            self._append_gap()
+        self.steps.append({"scroll": name, "value": int(event.value), "at": now})
+        self._last_release = now
+        self.refresh()
+        if self.single:
+            # Same contract as a key: capture it and hand it straight back.
+            self.status.setText("<b style='color:#2e7d32'>captured</b> "
+                                f"scroll {scroll_direction(self.steps[-1])}")
+            QTimer.singleShot(120, self.accept)
+
+    def separate_steps(self):
+        """Record key_down/key_up separately instead of a whole key press?"""
+        return not self.single and self.separate_check.isChecked()
+
+    def _append_event_gap(self, now):
+        """The pause before this press or release.
+
+        Unlike the chord path this measures every event, so the time a key is
+        held down becomes a wait between its key_down and key_up — which is the
+        point of the mode.
+        """
+        if self.fixed_delay_check.isChecked():
+            if self.steps and "wait" not in self.steps[-1]:
+                self.steps.append({"wait": self.fixed_delay_ms()})
+            return
+        if self._last_event_at is None:
+            return
+        gap = int((now - self._last_event_at) * 1000)
+        if self.MIN_WAIT_MS <= gap <= self.MAX_WAIT_MS:
+            self.steps.append({"wait": gap})
+
     def toggle_recording(self):
         self.stop() if self.recording else self.start()
 
@@ -1667,10 +1847,13 @@ class MacroRecorder(QDialog):
         self._held.clear()
         self._chord = []
         self._last_release = None      # don't turn the pause into a wait step
+        self._last_event_at = None
+        self._button_click_pending = False
         self.recording = True
         self._remaining = 120
         self._deadline.start(120_000)
         self.update_recording_state()
+        self.warn_about_held_keys()    # hides it for the duration
 
     def update_recording_state(self):
         if self.single:
@@ -1692,25 +1875,54 @@ class MacroRecorder(QDialog):
                 "<b>■ not recording</b> — press <b>Start recording</b> to begin")
 
     def drop_trailing_ui_click(self):
-        """Remove a click on this dialog that slipped into the macro.
+        """Remove the click that pressed this dialog's own button.
 
-        Belt and braces behind the event-filter suppression. It only fires when
-        the last step was created *by* the click that landed on this dialog —
-        the step's timestamp is after the moment Qt delivered that click — so a
-        click the user deliberately recorded a moment earlier is never eaten.
+        Stopping a recording means clicking Stop (or Use this macro), so that
+        click is always the last thing in the macro. This used to match it by
+        timestamp and kept getting it wrong: evdev and Qt report the same click
+        milliseconds apart in either order, and the release usually never
+        arrives at all because the devices are closed first — leaving the press
+        behind as a key_down(BTN_LEFT) that nothing ever releases.
+
+        Position is reliable where timing was not. If a button of this dialog
+        was clicked, whatever mouse-button step sits at the end of the macro is
+        that click, so it goes — along with its other half and the pause that
+        led into it.
         """
-        if not self.steps or not self._ui_click_at:
+        # Only when a button of this dialog was actually clicked — pressing
+        # Stop with the keyboard, or the recording timing out, leaves a genuine
+        # trailing click alone.
+        if not self.steps or not self._button_click_pending:
             return
-        if time.monotonic() - self._ui_click_at > 1.5:
-            return
+        self._button_click_pending = False
         last = self.steps[-1]
-        keys = last.get("keys") or []
-        created_by_that_click = last.get("at", 0) >= self._ui_click_at
-        if created_by_that_click and keys \
-                and all(name.startswith("BTN_") for name in keys):
+        names = last.get("keys") or [
+            n for n in (last.get("down"), last.get("up")) if n]
+        if not names or not all(name.startswith("BTN_") for name in names):
+            return
+        self.steps.pop()
+        if self.steps and "wait" in self.steps[-1]:
             self.steps.pop()
-            if self.steps and "wait" in self.steps[-1]:
-                self.steps.pop()
+        if "up" in last:
+            self.drop_matching_press(last["up"])
+
+    def drop_matching_press(self, name):
+        """Remove the key_down belonging to a key_up that has just been removed.
+
+        evdev can deliver the press a millisecond or two before Qt reports the
+        same click, so the release passes the "created by that click" test while
+        the press misses it. Left on its own the press is a button that is
+        pushed and never released — a stuck mouse button, for real.
+        """
+        for index in range(len(self.steps) - 1, -1, -1):
+            step = self.steps[index]
+            if step.get("up") == name:
+                return          # already paired with its own release
+            if step.get("down") == name:
+                del self.steps[index]
+                if index and "wait" in self.steps[index - 1]:
+                    del self.steps[index - 1]
+                return
 
     def stop(self):
         if self.recording:
@@ -1727,6 +1939,12 @@ class MacroRecorder(QDialog):
         for step in self.steps:
             if "wait" in step:
                 self.list.addItem(f"wait  {step['wait']} ms")
+            elif "scroll" in step:
+                self.list.addItem(f"scroll {scroll_direction(step)}")
+            elif "down" in step:
+                self.list.addItem(f"hold down  {step['down']}")
+            elif "up" in step:
+                self.list.addItem(f"release    {step['up']}")
             else:
                 keys = step["keys"]
                 label = " + ".join(keys)
@@ -1734,17 +1952,71 @@ class MacroRecorder(QDialog):
         if 0 <= row < self.list.count():
             self.list.setCurrentRow(row)
         self.preview.setText(self.macro_text())
+        self.warn_about_held_keys()
+
+    def held_at_end(self):
+        """Keys the macro presses and never releases."""
+        held = []
+        for step in self.steps:
+            if "down" in step and step["down"] not in held:
+                held.append(step["down"])
+            elif "up" in step and step["up"] in held:
+                held.remove(step["up"])
+        return held
+
+    def warn_about_held_keys(self):
+        """Flag a macro that leaves a key down when it finishes.
+
+        Only reachable in separate press/release mode. Holding a key on purpose
+        is legitimate, but a forgotten key_up leaves it stuck down for real —
+        worth saying out loud rather than discovering with a stuck button.
+        """
+        if self.single:
+            return
+        # Never while recording. In separate press/release mode a key counts as
+        # unreleased between every key_down and its key_up, so this would blink
+        # in and out as you type — and each time it appears the layout reflows
+        # and the Stop button shifts under the pointer you are reaching for it
+        # with. The macro is only finished once recording stops, so that is the
+        # only moment the question is worth asking.
+        if self.recording:
+            if self.balance_warning.isVisibleTo(self):
+                self.balance_warning.hide()
+                self.refit()
+            return
+        held = self.held_at_end()
+        if not held:
+            if self.balance_warning.isVisibleTo(self):
+                self.balance_warning.hide()
+                self.refit()
+            return
+        self.balance_warning.setText(
+            "<span style='color:#c07000'>This macro never releases "
+            f"<b>{', '.join(held)}</b>. That key stays held down after it runs "
+            "unless something else releases it.</span>")
+        self.balance_warning.show()
+        self.refit()
+
+    def refit(self):
+        """Grow the window when a message appears.
+
+        The minimum size is worked out at construction, with the warning label
+        hidden. Showing it later needs about 40px more than the window has, and
+        the layout answers by sliding the buttons up into the step list: a click
+        aimed at Stop then lands on the list — recorded into the macro instead of
+        stopping — or on the fixed-delay checkbox, silently switching it off.
+        """
+        layout = self.layout()
+        layout.invalidate()
+        layout.activate()
+        width = max(self.width(), self.minimumSizeHint().width())
+        needed = layout.minimumHeightForWidth(width)
+        self.setMinimumHeight(needed)
+        if self.height() < needed or self.width() < width:
+            self.resize(max(self.width(), width), max(self.height(), needed))
 
     def macro_text(self):
-        parts = []
-        for step in self.steps:
-            if "wait" in step:
-                parts.append(f"wait({step['wait']})")
-            elif len(step["keys"]) == 1:
-                parts.append(f"key({step['keys'][0]})")
-            else:
-                parts.append("hold_keys(" + ", ".join(step["keys"]) + ")")
-        return ".".join(parts)
+        return ".".join(step_text(step) for step in self.steps)
 
     def result_text(self):
         """A lone keypress is nicer expressed as the bare symbol."""
@@ -1798,12 +2070,17 @@ class MacroRecorder(QDialog):
         # one lands on this dialog, so the same physical click arriving from
         # evdev a moment later isn't recorded as part of the macro. This covers
         # every button (Stop, Use this macro, Delete step…), not just Stop.
+        if event.type() == types.Wheel:
+            # The scroll is being recorded, so don't also scroll the step list.
+            return isinstance(obj, QWidget) and self.isAncestorOf(obj)
         if event.type() in (types.MouseButtonPress, types.MouseButtonRelease,
                             types.MouseButtonDblClick):
             if not isinstance(obj, QWidget) or not self.isAncestorOf(obj):
                 return super().eventFilter(obj, event)   # not our window
             if self.presses_a_button(obj):
                 self._ui_click_at = time.monotonic()
+                if event.type() == types.MouseButtonPress:
+                    self._button_click_pending = True
                 return super().eventFilter(obj, event)
             # Anywhere else on this dialog: the click belongs in the macro, so
             # let evdev record it and stop it reaching the widget underneath —
@@ -1847,8 +2124,43 @@ class MacroRecorder(QDialog):
         if self.recording:
             self.drop_trailing_ui_click()
             self.recording = False
+        stuck = [n for n in self.held_at_end() if n.startswith("BTN_")]
+        if stuck and not self.settle_stuck_buttons(stuck):
+            return              # keep the dialog open so it can be fixed
         self.close()
         super().accept()
+
+    def settle_stuck_buttons(self, stuck):
+        """Last line of defence against handing back a stuck mouse button.
+
+        The warning label says it, but a warning is easy to walk past and the
+        consequence here is losing the ability to click at all. A held *key* is
+        only warned about; a held mouse button has to be answered for.
+        """
+        names = ", ".join(stuck)
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("A mouse button is never released")
+        box.setText(f"This macro presses <b>{names}</b> and never releases it.")
+        box.setInformativeText(
+            "Running it would leave that button held down. With left click that "
+            "means you can't click anything — including the window you'd need to "
+            "undo it.\n\nUsually this is the click that pressed a button in this "
+            "recorder, caught by accident.")
+        release = box.addButton("Add the release",
+                                QMessageBox.ButtonRole.AcceptRole)
+        anyway = box.addButton("Use as it is",
+                               QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(release)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is release:
+            for name in stuck:
+                self.steps.append({"up": name, "at": time.monotonic()})
+            self.refresh()
+            return True
+        return clicked is anyway
 
 
 class PresetEditor(QDialog):
