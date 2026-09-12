@@ -521,20 +521,41 @@ def delete_preset(device, preset):
     return True, f"deleted “{preset}”"
 
 
-def create_preset_from_default(device, preset):
-    """Copy the device's Default preset to a new name. (ok, message)."""
-    source = PRESET_DIR / device / f"{DEFAULT_PRESET}.json"
+def create_preset_from(device, preset, base=DEFAULT_PRESET):
+    """Copy one of the device's presets to a new name. (ok, message)."""
+    base = base or DEFAULT_PRESET
+    source = PRESET_DIR / device / f"{base}.json"
     target = PRESET_DIR / device / f"{safe_preset_name(preset)}.json"
     if target.exists():
         return False, f"“{preset}” already exists"
     if not source.is_file():
-        return False, f"no {DEFAULT_PRESET}.json to copy for “{device}”"
+        return False, f"no {base}.json to copy for “{device}”"
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, target)
     except OSError as exc:
         return False, f"“{preset}”: {exc}"
-    return True, f"created “{target.stem}”"
+    return True, f"created “{target.stem}” from “{base}”"
+
+
+def choose_base_preset(parent, device, what):
+    """Ask which existing preset a new one should be copied from.
+
+    Returns the chosen name, or None if the user cancelled. Copying Default was
+    the old fixed behaviour; it stays the preselected answer, and the question is
+    skipped entirely when the device has nothing to choose between.
+    """
+    presets = presets_for(device)
+    if not presets:
+        return DEFAULT_PRESET    # nothing to copy; create_preset_from says why
+    if len(presets) == 1:
+        return presets[0]
+    preferred = DEFAULT_PRESET if DEFAULT_PRESET in presets else presets[0]
+    name, ok = QInputDialog.getItem(
+        parent, "Base the new preset on",
+        f"Create {what} by copying which preset of “{device}”?",
+        presets, presets.index(preferred), False)
+    return name if ok else None
 
 
 BUS_TAKEN_RE = re.compile(r"already running|Name request has failed", re.I)
@@ -2939,12 +2960,14 @@ class PresetCell(QWidget):
 class SteamPicker(QDialog):
     """Pick games from the installed Steam libraries to add as mappings."""
 
-    def __init__(self, existing, parent=None):
+    def __init__(self, existing, parent=None, presets=(), device=""):
         super().__init__(parent)
         self.setWindowTitle("Add from Steam library")
         self.resize(900, 620)
         self.existing = {normalize(p) for p in existing if p}
         self.chosen = []
+        self.presets = list(presets)
+        self.device = device
 
         layout = QVBoxLayout(self)
         self.info = QLabel()
@@ -2966,11 +2989,11 @@ class SteamPicker(QDialog):
         layout.addWidget(self.table, 1)
 
         self.create_presets = QCheckBox(
-            f"Create a preset for each game by copying “{DEFAULT_PRESET}”, named after "
-            "the Steam game")
+            "Create a preset for each game, named after the Steam game — you'll be "
+            "asked which existing preset to copy")
         self.create_presets.setChecked(True)
         self.create_presets.setToolTip(
-            "Copies <device>/Default.json to <device>/<game name>.json for any game "
+            "Copies a preset you choose to <device>/<game name>.json for any game "
             "that has no preset yet. Existing presets are never overwritten.")
         layout.addWidget(self.create_presets)
 
@@ -3404,11 +3427,17 @@ class MainWindow(QMainWindow):
         self.table.setCurrentCell(r, 0)
         self.mark_dirty()
 
-        # Named a preset that doesn't exist yet? Create it from Default, the same
-        # as importing from Steam does — otherwise the row is added already
-        # broken and the preset has to be made by hand.
+        # Named a preset that doesn't exist yet? Create it, the same as importing
+        # from Steam does — otherwise the row is added already broken and the
+        # preset has to be made by hand.
         if proc and preset and not preset_exists(device, preset):
-            ok, message = create_preset_from_default(device, preset)
+            base = choose_base_preset(self, device, f"“{preset}”")
+            if base is None:
+                self.status.showMessage(
+                    f"Added “{proc}” — preset “{preset}” still needs creating",
+                    15000)
+                return
+            ok, message = create_preset_from(device, preset, base)
             self.refresh_preset_lists()
             self.table.setCurrentCell(r, 0)
             self.status.showMessage(
@@ -3585,7 +3614,7 @@ class MainWindow(QMainWindow):
         self.refresh_fix_indicator()
 
     def create_presets_for_selection(self):
-        """Copy Default.json to the preset name of every selected row that lacks one."""
+        """Copy a chosen preset to the name of every selected row that lacks one."""
         rows = self.selected_rows()
         if not rows:
             return
@@ -3600,16 +3629,21 @@ class MainWindow(QMainWindow):
                 "Every selected row already points at an existing preset.")
             return
 
+        # One question for the lot: they are all being created together, and
+        # asking per row would be a dialog each.
+        base = choose_base_preset(self, todo[0][0], f"{len(todo)} new preset(s)")
+        if base is None:
+            return
         names = "\n".join(f"  • {p}  ({d})" for d, p in todo)
         answer = QMessageBox.question(
             self, "Create presets",
-            f"Copy “{DEFAULT_PRESET}” to {len(todo)} new preset(s)?\n\n{names}")
+            f"Copy “{base}” to {len(todo)} new preset(s)?\n\n{names}")
         if answer != QMessageBox.StandardButton.Yes:
             return
 
         created, failed = [], []
         for device, preset in todo:
-            ok, message = create_preset_from_default(device, preset)
+            ok, message = create_preset_from(device, preset, base)
             (created if ok else failed).append(message)
         self.refresh_preset_lists()
 
@@ -3702,10 +3736,13 @@ class MainWindow(QMainWindow):
             answer = QMessageBox.question(
                 self, "Preset doesn't exist yet",
                 f"“{preset or '(none)'}” doesn't exist for “{device}”.\n\n"
-                f"Create it from {DEFAULT_PRESET} and edit it?")
+                "Create it from an existing preset and edit it?")
             if answer != QMessageBox.StandardButton.Yes:
                 return
-            ok, message = create_preset_from_default(device, preset)
+            base = choose_base_preset(self, device, f"“{preset}”")
+            if base is None:
+                return
+            ok, message = create_preset_from(device, preset, base)
             if not ok:
                 QMessageBox.warning(self, "Could not create preset", message)
                 return
@@ -3718,7 +3755,7 @@ class MainWindow(QMainWindow):
     def build_presets_menu(self, menu):
         """Preset actions, plus every device's presets — rebuilt on each open."""
         menu.clear()
-        menu.addAction("Create preset from Default (selected rows)",
+        menu.addAction("Create preset for selected rows…",
                        self.create_presets_for_selection)
         menu.addAction("Create new device default…", self.create_device_default)
         menu.addSeparator()
@@ -3830,21 +3867,36 @@ class MainWindow(QMainWindow):
         return self.devices[0] if self.devices else ""
 
     def add_from_steam(self):
-        dialog = SteamPicker([p for p, _d, _s in self.rows()], self)
+        device = self.target_device()
+        dialog = SteamPicker([p for p, _d, _s in self.rows()], self,
+                             presets_for(device), device)
         if not dialog.exec() or not dialog.chosen:
             return
 
-        device = self.target_device()
         by_norm = {normalize(p): p for p in presets_for(device)}
         added, created, failed, missing = 0, [], [], []
 
+        # Ask once for the whole import, and only when something actually needs
+        # creating — a game that already has a preset raises no question.
+        wanted = [by_norm.get(normalize(game), safe_preset_name(game))
+                  for game, _process in dialog.chosen]
+        needed = [p for p in wanted if not preset_exists(device, p)]
+        base = DEFAULT_PRESET
+        if needed and dialog.create_presets.isChecked():
+            base = choose_base_preset(
+                self, device,
+                f"{len(needed)} new preset(s)" if len(needed) > 1
+                else f"“{needed[0]}”")
+            if base is None:
+                return
+
         for game, process in dialog.chosen:
             # Reuse an existing preset whose name matches the game; otherwise use
-            # the game's own name, creating it from Default when asked to.
+            # the game's own name, copying the chosen base when asked to.
             preset = by_norm.get(normalize(game), safe_preset_name(game))
             if not preset_exists(device, preset):
                 if dialog.create_presets.isChecked():
-                    ok, message = create_preset_from_default(device, preset)
+                    ok, message = create_preset_from(device, preset, base)
                     (created if ok else failed).append(message)
                 else:
                     missing.append(preset)
@@ -3857,7 +3909,7 @@ class MainWindow(QMainWindow):
 
         parts = [f"Added {added} mapping(s) on “{device}”"]
         if created:
-            parts.append(f"{len(created)} preset(s) copied from {DEFAULT_PRESET}")
+            parts.append(f"{len(created)} preset(s) copied from “{base}”")
         if failed:
             parts.append(f"{len(failed)} preset(s) failed: " + "; ".join(failed[:3]))
         if missing:
