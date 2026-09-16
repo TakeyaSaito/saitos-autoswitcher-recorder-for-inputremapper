@@ -11,5 +11,5 @@ settings.conf
 *.swp
 .DS_Store
 
-# Private project context for Claude Code — names a second machine, never publish
+# Local notes, not part of the project
 CLAUDE.md
