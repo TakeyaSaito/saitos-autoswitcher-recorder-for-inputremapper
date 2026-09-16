@@ -10,3 +10,6 @@ settings.conf
 # Editor / OS noise
 *.swp
 .DS_Store
+
+# Private project context for Claude Code — names a second machine, never publish
+CLAUDE.md

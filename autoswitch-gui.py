@@ -1481,16 +1481,22 @@ def split_trailing_wait(text):
     return (text[:match.start()], int(match.group(1))) if match else (text, None)
 
 
-def build_output(base, hold, delay_ms=None):
+# The two Input Remapper wrappers that loop their body. hold(...) runs while the
+# trigger key is down; toggle(...) starts on one press and stops on the next, so
+# the key doesn't have to be held. Order matters only for the combo box.
+LOOP_MODES = ("hold", "toggle")
+
+
+def build_output(base, mode, delay_ms=None):
     """Assemble the output symbol from its parts.
 
-    hold(...) loops while the key is held; a wait at the end of the loop body is
-    what stops it repeating as fast as the CPU allows.
+    `mode` is one of LOOP_MODES, or None for no looping. A wait at the end of
+    the loop body is what stops it repeating as fast as the CPU allows.
     """
     base = (base or "").strip()
     if not base:
         return ""
-    if not hold:
+    if mode not in LOOP_MODES:
         return base
     # Any trailing wait is the loop delay's, so drop it before adding the
     # current one — otherwise editing a macro stacks a second wait each pass.
@@ -1498,37 +1504,43 @@ def build_output(base, hold, delay_ms=None):
     inner = base if "(" in base else f"key({base})"
     if delay_ms:
         inner = f"{inner}.wait({delay_ms})"
-    return f"hold({inner})"
+    return f"{mode}({inner})"
 
 
-def wrap_hold(text):
-    """Wrap an output in hold(...) so it loops while the trigger key is held."""
+def loop_mode_of(text):
+    """'hold', 'toggle' or None — the wrapper covering the whole expression.
+
+    Only a wrapper whose opening bracket closes at the very end counts, so
+    `hold(a).key(b)` is not treated as a loop.
+    """
     text = (text or "").strip()
-    if not text or is_held(text):
-        return text
-    inner = text if "(" in text else f"key({text})"
-    return f"hold({inner})"
+    for mode in LOOP_MODES:
+        # hold_keys(...) is a different function; the "(" in the prefix excludes it.
+        if not text.startswith(f"{mode}(") or not text.endswith(")"):
+            continue
+        depth = 0
+        for index, char in enumerate(text):
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0:
+                    if index == len(text) - 1:
+                        return mode
+                    break  # closes early, so it only wraps part of the macro
+    return None
 
 
-def is_held(text):
-    """True when the output is a hold(...) covering the whole expression."""
+def is_looped(text):
+    """True when the output is wrapped in hold(...) or toggle(...)."""
+    return loop_mode_of(text) is not None
+
+
+def unwrap_loop(text):
+    """Strip an enclosing hold(...)/toggle(...), leaving the loop body."""
     text = (text or "").strip()
-    if not text.startswith("hold(") or not text.endswith(")"):
-        return False
-    depth = 0
-    for index, char in enumerate(text):
-        if char == "(":
-            depth += 1
-        elif char == ")":
-            depth -= 1
-            if depth == 0:
-                return index == len(text) - 1  # the opening hold( closes at the end
-    return False
-
-
-def unwrap_hold(text):
-    text = (text or "").strip()
-    return text[len("hold("):-1].strip() if is_held(text) else text
+    mode = loop_mode_of(text)
+    return text[len(mode) + 1:-1].strip() if mode else text
 
 
 MACRO_STEP_RE = re.compile(r"(key_down|key_up|key|wait|hold_keys|event)\(([^)]*)\)")
@@ -2411,7 +2423,7 @@ class PresetEditor(QDialog):
         inner.addLayout(input_row)
 
         inner.addWidget(QLabel("<b>Output</b> — a key name, or a macro like "
-                               "<tt>hold(KEY_A)</tt>. Macros can span several "
+                               "<tt>toggle(KEY_A)</tt>. Macros can span several "
                                "lines."))
         output_row = QHBoxLayout()
         self.output_field = MacroEdit()
@@ -2437,10 +2449,19 @@ class PresetEditor(QDialog):
         inner.addLayout(output_row)
 
         hold_row = QHBoxLayout()
-        self.hold_check = QCheckBox("Loop if held — repeat while the input key is "
-                                    "down (wraps the output in hold(…))")
+        self.hold_check = QCheckBox("Loop the output —")
         self.hold_check.toggled.connect(self.toggle_hold)
         hold_row.addWidget(self.hold_check)
+        self.loop_mode_combo = QComboBox()
+        self.loop_mode_combo.addItems(["while the input key is held  (hold)",
+                                       "until the key is pressed again  (toggle)"])
+        self.loop_mode_combo.setToolTip(
+            "hold(…) repeats only while you keep the key down.\n"
+            "toggle(…) starts on one press and stops on the next, so the key "
+            "does not have to be held.")
+        self.loop_mode_combo.currentIndexChanged.connect(
+            lambda _i: self.rebuild_output())
+        hold_row.addWidget(self.loop_mode_combo)
         hold_row.addWidget(QLabel("loop delay:"))
         self.loop_delay_field = QLineEdit()
         self.loop_delay_field.setFixedWidth(70)
@@ -2619,7 +2640,7 @@ class PresetEditor(QDialog):
         for widget in (self.input_field, self.output_field, self.record_input,
                        self.record_output, self.target_combo, self.type_combo,
                        self.output_type, self.output_code, self.hold_check,
-                       self.record_key):
+                       self.loop_mode_combo, self.record_key):
             widget.setEnabled(enabled)
         if mapping is None:
             self.input_field.clear(); self.output_field.clear()
@@ -2631,8 +2652,12 @@ class PresetEditor(QDialog):
             if mapping.has_input_defined() else "")
         self.output_field.setText(mapping.output_symbol or "")
         symbol = mapping.output_symbol or ""
-        self.hold_check.setChecked(is_held(symbol))
-        _base, loop_delay = split_trailing_wait(unwrap_hold(symbol)) if is_held(symbol) \
+        mode = loop_mode_of(symbol)
+        self.hold_check.setChecked(mode is not None)
+        self.loop_mode_combo.setCurrentIndex(LOOP_MODES.index(mode) if mode else 0)
+        # The mode only means anything while the box is ticked.
+        self.loop_mode_combo.setEnabled(enabled and mode is not None)
+        _base, loop_delay = split_trailing_wait(unwrap_loop(symbol)) if mode \
             else (symbol, None)
         self.loop_delay_field.setText("" if loop_delay is None else str(loop_delay))
         self.target_combo.setCurrentText(mapping.target_uinput or "keyboard")
@@ -2848,7 +2873,7 @@ class PresetEditor(QDialog):
         if not text:
             return
         self.output_field.setText(
-            build_output(text, self.hold_check.isChecked(), self.loop_delay_ms()))
+            build_output(text, self.loop_mode(), self.loop_delay_ms()))
         self.pull_form()
 
     @guard
@@ -2867,12 +2892,12 @@ class PresetEditor(QDialog):
             sources = []
 
         # A trailing wait only belongs to the loop delay when the output is a
-        # hold(...) — then it is re-applied on the way back, so leaving it in
-        # would return as an extra step and be appended twice. Without hold it
-        # is an ordinary part of the macro and must stay visible in the editor.
+        # hold(...)/toggle(...) — then it is re-applied on the way back, so
+        # leaving it in would return as an extra step and be appended twice.
+        # Unlooped it is an ordinary part of the macro and must stay visible.
         current = self.output_field.text()
-        if is_held(current):
-            base, _delay = split_trailing_wait(unwrap_hold(current))
+        if is_looped(current):
+            base, _delay = split_trailing_wait(unwrap_loop(current))
         else:
             base = current
 
@@ -2887,28 +2912,39 @@ class PresetEditor(QDialog):
         text = recorder.result_text()
         if not text:
             return
-        # Keep whatever the Loop-if-held tick and its delay were set to.
+        # Keep whatever the loop tick, its mode and its delay were set to.
         self.output_field.setText(
-            build_output(text, self.hold_check.isChecked(), self.loop_delay_ms()))
+            build_output(text, self.loop_mode(), self.loop_delay_ms()))
         self.pull_form()
 
     def loop_delay_ms(self):
         text = self.loop_delay_field.text().strip()
         return max(1, min(int(text), 60_000)) if text.isdigit() else None
 
+    def loop_mode(self):
+        """'hold', 'toggle' or None — what the Loop row is currently asking for."""
+        if not self.hold_check.isChecked():
+            return None
+        return LOOP_MODES[self.loop_mode_combo.currentIndex()]
+
     @guard
     def rebuild_output(self):
-        """Re-assemble the output from its base macro, the hold and its delay."""
+        """Re-assemble the output from its base macro, the loop and its delay."""
         if self.loading:
             return
-        base, _old = split_trailing_wait(unwrap_hold(self.output_field.text().strip()))
-        rebuilt = build_output(base, self.hold_check.isChecked(), self.loop_delay_ms())
+        text = self.output_field.text().strip()
+        # A trailing wait is only the loop delay's when the output is actually
+        # looped. On an unlooped macro it is an ordinary step, and stripping it
+        # here silently deleted it as soon as the delay field was touched.
+        base = split_trailing_wait(unwrap_loop(text))[0] if is_looped(text) else text
+        rebuilt = build_output(base, self.loop_mode(), self.loop_delay_ms())
         if rebuilt != self.output_field.text():
             self.output_field.setText(rebuilt)
         self.pull_form()
 
     @guard
-    def toggle_hold(self, _checked):
+    def toggle_hold(self, checked):
+        self.loop_mode_combo.setEnabled(checked)
         self.rebuild_output()
 
     # ---------- mappings ----------

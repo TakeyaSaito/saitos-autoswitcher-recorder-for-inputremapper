@@ -169,8 +169,9 @@ device reports its raw keys.
   once for a combination. The device is grabbed exclusively so the key doesn't
   fire while you bind it; Esc cancels.
 - **Edit** (output) opens the macro editor.
-- **Loop if held** wraps the output in `hold(…)` so it repeats while the input is
-  held, with a **loop delay** field that paces each pass.
+- **Loop the output** wraps it in either `hold(…)`, which repeats while the input
+  key is held down, or `toggle(…)`, which starts on one press and stops on the
+  next so the key doesn't have to be held. A **loop delay** field paces each pass.
 - **Sends to** is detected from the output — keyboard keys to the keyboard, mouse
   buttons to the mouse, a mix to both — using Input Remapper's own capability
   tables. Choosing one yourself stops it being adjusted.
@@ -199,8 +200,8 @@ key(KEY_1).wait(600).hold_keys(KEY_2, KEY_3)
   presses **Stop** is removed from the macro along with the pause before it.
 
 > **Version note.** The recorder writes Input Remapper's 2.x macro syntax —
-> `key()`, `wait()`, `hold_keys()`, `hold()` — and reads presets in the 2.x
-> format, where each mapping carries an `input_combination` with an
+> `key()`, `wait()`, `hold_keys()`, `hold()`, `toggle()` — and reads presets in
+> the 2.x format, where each mapping carries an `input_combination` with an
 > `origin_hash`. Input Remapper 1.x used a different preset format and a
 > different macro language, so the preset editor, the macro recorder and **Fix
 > profile assignments** will not work against it. Developed and tested against
