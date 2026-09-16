@@ -19,8 +19,8 @@ import time
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QEventLoop, QProcess, QTimer
-from PyQt6.QtGui import (QBrush, QColor, QFont, QIcon, QKeySequence,
-                         QShortcut)
+from PyQt6.QtGui import (QBrush, QColor, QFont, QFontMetrics, QIcon,
+                         QKeySequence, QShortcut)
 from PyQt6.QtWidgets import (
     QAbstractButton, QAbstractItemView, QAbstractSpinBox,
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
@@ -2411,24 +2411,29 @@ class PresetEditor(QDialog):
         inner.addLayout(input_row)
 
         inner.addWidget(QLabel("<b>Output</b> — a key name, or a macro like "
-                               "<tt>hold(KEY_A)</tt>"))
+                               "<tt>hold(KEY_A)</tt>. Macros can span several "
+                               "lines."))
         output_row = QHBoxLayout()
-        self.output_field = QLineEdit()
-        self.output_field.textEdited.connect(lambda _t: self.pull_form())
+        self.output_field = MacroEdit()
+        # textChanged also fires for programmatic changes, but pull_form() is a
+        # no-op while the form is being populated.
+        self.output_field.textChanged.connect(self.pull_form)
         output_row.addWidget(self.output_field, 1)
         self.record_key = QPushButton("Single key")
         self.record_key.setToolTip(
             "Press one key (or a chord) and use it as the output — no macro "
             "screen, no timing.")
         self.record_key.clicked.connect(self.do_record_single_key)
-        output_row.addWidget(self.record_key)
+        # Top-aligned: the box is several lines tall now, and buttons centred
+        # against it float in the middle of nowhere.
+        output_row.addWidget(self.record_key, 0, Qt.AlignmentFlag.AlignTop)
 
         self.record_output = QPushButton("Macro")
         self.record_output.setToolTip(
             "Open the macro editor: review the existing steps, then record more "
             "keys, chords and the pauses between them.")
         self.record_output.clicked.connect(self.do_record_output)
-        output_row.addWidget(self.record_output)
+        output_row.addWidget(self.record_output, 0, Qt.AlignmentFlag.AlignTop)
         inner.addLayout(output_row)
 
         hold_row = QHBoxLayout()
@@ -3054,6 +3059,36 @@ class PresetEditor(QDialog):
         self.error_label.setText(
             f"<span style='color:#2e7d32'>✓ saved “{self.preset_name}” — "
             "carry on editing</span>")
+
+
+class MacroEdit(QPlainTextEdit):
+    """The output box: multi-line, but still answers text()/setText().
+
+    A macro of any size is unreadable squeezed onto one line — Input Remapper's
+    own editor is multi-line for the same reason. Keeping the QLineEdit API
+    means the rest of the editor doesn't have to know the difference.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFont(QFont("monospace"))
+        self.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        # Tab belongs to the form, not the text: this is a field, not an editor.
+        self.setTabChangesFocus(True)
+        self.setPlaceholderText("KEY_A   or   key(KEY_A).wait(100).key(KEY_B)")
+        rows = 4
+        self.setMinimumHeight(
+            int(QFontMetrics(self.font()).lineSpacing() * rows
+                + self.contentsMargins().top() + self.contentsMargins().bottom() + 12))
+
+    def text(self):
+        return self.toPlainText()
+
+    def setText(self, value):
+        # Guarded: setPlainText moves the cursor and clears undo, so don't do it
+        # when nothing actually changed.
+        if (value or "") != self.toPlainText():
+            self.setPlainText(value or "")
 
 
 class NoScrollComboBox(QComboBox):
