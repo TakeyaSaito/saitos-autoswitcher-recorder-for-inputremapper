@@ -623,30 +623,181 @@ def stop_injections():
 
 
 def release_all_keys():
-    """Belt and braces: send a key-up for every key code from a scratch device.
+    """Belt and braces: send a key-up for everything, so nothing stays held.
+
+    Sent from two devices that are *shaped* like a keyboard and a mouse, rather
+    than one device declaring every code there is. That matters: libinput
+    classifies a device by the codes it advertises, and one carrying keyboard,
+    pointer, joystick and gamepad buttons at once is not a keyboard or a
+    pointer, so the compositor ignores its releases — which is exactly why a key
+    stranded by a restart stayed stuck despite this running.
 
     Releasing a key that isn't held is a no-op, so this can only ever unstick
     things. Best effort — if uinput isn't writable we simply skip it.
     """
     try:
-        import evdev
         from evdev import UInput, ecodes
     except ImportError:
         return False
+
+    # BTN_MISC..BTN_GEAR_UP is the button range; everything else in `keys` is a
+    # keyboard key.
+    all_codes = sorted(ecodes.keys.keys())
+    keyboard = [c for c in all_codes if c < 0x100 or c >= 0x160]
+    pointer = [c for c in range(0x110, 0x118)]      # BTN_LEFT..BTN_TASK
+
+    released = False
+    for name, caps, codes in (
+            ("autoswitch-key-release-keyboard", {ecodes.EV_KEY: keyboard}, keyboard),
+            ("autoswitch-key-release-mouse",
+             {ecodes.EV_KEY: pointer,
+              ecodes.EV_REL: [ecodes.REL_X, ecodes.REL_Y]}, pointer)):
+        try:
+            device = UInput(caps, name=name)
+        except (OSError, PermissionError):
+            continue
+        try:
+            time.sleep(0.4)  # let the compositor register the new device
+            for code in codes:
+                device.write(ecodes.EV_KEY, code, 0)
+            device.syn()
+            time.sleep(0.2)
+            released = True
+        finally:
+            device.close()
+    return released
+
+
+# Re-enumerating a device is the only way to clear a key the compositor still
+# believes is held. USBDEVFS_RESET, from linux/usbdevice_fs.h.
+USB_RESET_IOCTL = (ord("U") << 8) | 20
+USB_RESET_SCRIPT = (
+    "import fcntl, sys\n"
+    "fcntl.ioctl(open(sys.argv[1], 'wb'), %d, 0)\n" % USB_RESET_IOCTL)
+
+
+def usb_address_for(device_name):
+    """(bus, device) of the USB device behind an input device, or None.
+
+    Climbs from the device's /sys entry until it reaches the USB device that
+    owns it — the event node itself carries no bus or device number.
+    """
+    for path, _digest in device_nodes(device_name):
+        node = Path("/sys/class/input") / Path(path).name / "device"
+        try:
+            node = node.resolve()
+        except OSError:
+            continue
+        for _ in range(8):
+            try:
+                if (node / "idVendor").exists():
+                    return (int((node / "busnum").read_text()),
+                            int((node / "devnum").read_text()))
+            except (OSError, ValueError):
+                break
+            node = node.parent
+    return None
+
+
+def reset_input_device(device_name):
+    """Make a device disconnect and come back, clearing any key stuck down.
+
+    A key held while Input Remapper is torn down never delivers its release, and
+    the compositor keeps that key down for the whole session — every app, with
+    and without Shift. Key state is tracked per device, so a synthetic device
+    cannot release it on the real one's behalf; only the device itself can, and
+    re-enumerating it is what makes the compositor drop the state.
+    """
+    address = usb_address_for(device_name)
+    if address is None:
+        return False, f"“{device_name}” is not on USB, or has gone away"
+    path = "/dev/bus/usb/%03d/%03d" % address
+    code, out, how = run_privileged(
+        [sys.executable or "python3", "-c", USB_RESET_SCRIPT, path])
+    if code == 0:
+        return True, f"reset “{device_name}”"
+    if how == "denied":
+        return False, f"“{device_name}”: authorization declined"
+    return False, f"“{device_name}”: {(out or '').strip().splitlines()[-1] if out else 'reset failed'}"
+
+
+def presets_for_device_paths(device):
+    """Every non-empty preset file belonging to a device."""
+    directory = PRESET_DIR / device
+    if not directory.is_dir():
+        return []
+    return [f for f in sorted(directory.glob("*.json")) if f.stat().st_size]
+
+
+def hashes_used_by(device):
+    """{origin hash: how many mappings use it} across a device's presets."""
+    counts = {}
+    for f in presets_for_device_paths(device):
+        try:
+            data = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        for mapping in (data if isinstance(data, list) else data.get("mappings", [])):
+            for config in (mapping.get("input_combination") or []):
+                digest = config.get("origin_hash")
+                if digest:
+                    counts[digest] = counts.get(digest, 0) + 1
+    return counts
+
+
+def repoint_device_presets(device, new_hash):
+    """Bind a device's mappings to the node that actually emits their keys.
+
+    A preset stores the origin hash of the node it listens on. That hash can
+    stay perfectly valid while no longer being the node the device sends key
+    presses from — re-enumerating the device makes its driver re-attach, and the
+    keypad can come back on a different interface. The mappings then match
+    nothing: the preset loads, the daemon injects, and every key falls through
+    unremapped. Only codes the new node can actually emit are moved.
+
+    Returns (changed_presets, skipped_codes, backup_stamp).
+    """
     try:
-        keys = sorted(ecodes.keys.keys())
-        device = UInput({ecodes.EV_KEY: keys}, name="autoswitch-key-release-helper")
-    except (OSError, PermissionError):
-        return False
+        import evdev
+    except ImportError:
+        return [], [], ""
+    live = current_device_hashes() or {}
+    if new_hash not in live:
+        return [], [], ""
     try:
-        time.sleep(0.4)  # let the compositor register the new device
-        for code in keys:
-            device.write(ecodes.EV_KEY, code, 0)
-        device.syn()
-        time.sleep(0.2)
-    finally:
-        device.close()
-    return True
+        node = evdev.InputDevice(live[new_hash]["path"])
+        emits = set(node.capabilities().get(evdev.ecodes.EV_KEY, []))
+        node.close()
+    except OSError:
+        return [], [], ""
+
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    changed, skipped = [], []
+    for f in presets_for_device_paths(device):
+        original = f.read_text()
+        try:
+            data = json.loads(original)
+        except ValueError:
+            continue
+        moved = 0
+        for mapping in (data if isinstance(data, list) else data.get("mappings", [])):
+            for config in (mapping.get("input_combination") or []):
+                digest = config.get("origin_hash")
+                if not digest or digest == new_hash:
+                    continue
+                if config.get("code") in emits:
+                    config["origin_hash"] = new_hash
+                    moved += 1
+                else:
+                    skipped.append(f"{f.stem}: code {config.get('code')}")
+        if moved:
+            try:
+                f.with_name(f"{f.name}.bak-{stamp}").write_text(original)
+                f.write_text(json.dumps(data, indent=4))
+            except OSError:
+                continue
+            changed.append((f.stem, moved))
+    return changed, skipped, stamp
 
 
 def clear_squatters():
@@ -2957,6 +3108,102 @@ class PresetCell(QWidget):
         self.combo.setCurrentText(text)
 
 
+class IdentifyNode(QDialog):
+    """Ask for one key press and report which node of a device sent it.
+
+    There is no way to work this out from the device alone: several of a
+    device's nodes can advertise the same key codes, and only one of them
+    actually sends them. Watching a real press is the only reliable answer, and
+    it is the evidence that identifies a preset bound to the wrong node.
+    """
+
+    def __init__(self, device, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Which key?")
+        self.device = device
+        self.origin_hash = None
+        self._devices = []
+
+        layout = QVBoxLayout(self)
+        label = QLabel(
+            f"Press any key on <b>{device}</b> — one you have mapped.<br><br>"
+            "This identifies which of the device's nodes actually sends your key "
+            "presses, so the presets can be pointed at it. Nothing is recorded.")
+        label.setWordWrap(True)
+        layout.addWidget(label)
+        self.status = QLabel("<b style='color:#d13438'>● waiting for a key</b>")
+        layout.addWidget(self.status)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("Skip this check")
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self._open()
+        self._remaining = 30
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start(1000)
+
+    def _open(self):
+        """Read every node of this device — never grabbing, so keys still work."""
+        try:
+            import evdev
+        except ImportError:
+            self.status.setText("python-evdev is not installed.")
+            return
+        from PyQt6.QtCore import QSocketNotifier
+        for path, digest in device_nodes(self.device):
+            try:
+                device = evdev.InputDevice(path)
+            except OSError:
+                continue
+            notifier = QSocketNotifier(device.fd, QSocketNotifier.Type.Read, self)
+            notifier.activated.connect(
+                lambda _s, d=device, h=digest: self._read(d, h))
+            self._devices.append((device, notifier))
+        if not self._devices:
+            self.status.setText(
+                "<b style='color:#d13438'>None of this device's nodes could be "
+                "read.</b>")
+
+    def _read(self, device, digest):
+        import evdev
+        try:
+            events = list(device.read())
+        except OSError:
+            return
+        for event in events:
+            if event.type == evdev.ecodes.EV_KEY and event.value == 1:
+                self.origin_hash = digest
+                self.accept()
+                return
+
+    def _tick(self):
+        self._remaining -= 1
+        if self._remaining <= 0:
+            self.reject()
+            return
+        self.status.setText("<b style='color:#d13438'>● waiting for a key</b> "
+                            f"<i>({self._remaining}s)</i>")
+
+    def closeEvent(self, event):
+        self._timer.stop()
+        for device, notifier in self._devices:
+            notifier.setEnabled(False)
+            device.close()
+        self._devices = []
+        super().closeEvent(event)
+
+    def reject(self):
+        self.close()
+        super().reject()
+
+    def accept(self):
+        self.close()
+        super().accept()
+
+
 class SteamPicker(QDialog):
     """Pick games from the installed Steam libraries to add as mappings."""
 
@@ -3288,6 +3535,16 @@ class MainWindow(QMainWindow):
         self.fix_button_text = "Fix profile assignments…"
         self.fix_button.clicked.connect(self.fix_assignments)
         row.addWidget(self.fix_button)
+
+        # Deliberately a button and not a menu entry: when a key is stuck you
+        # may not be able to type, so this has to be findable in one click.
+        self.unstick_button = QPushButton("Unstick keys…")
+        self.unstick_button.setToolTip(
+            "A key held while Input Remapper restarts never sends its release, "
+            "and stays down for the whole session — in every application. This "
+            "makes the device disconnect and come back, which clears it.")
+        self.unstick_button.clicked.connect(self.unstick_keys)
+        row.addWidget(self.unstick_button)
         row.addStretch(1)
         outer.addLayout(row)
 
@@ -3725,6 +3982,115 @@ class MainWindow(QMainWindow):
             parts.append(self.run_reload())
         self.refresh_fix_indicator()
         self.status.showMessage(" — ".join(parts), 25000)
+
+    @guard
+    def unstick_keys(self):
+        """Re-enumerate a device to release a key the compositor thinks is held."""
+        devices = list(self.devices)
+        if not devices:
+            QMessageBox.information(self, "No devices",
+                                    "No Input Remapper devices were found.")
+            return
+
+        every = "All devices"
+        choices = devices + ([every] if len(devices) > 1 else [])
+        current = self.target_device()
+        index = choices.index(current) if current in choices else 0
+        choice, ok = QInputDialog.getItem(
+            self, "Unstick keys",
+            "A key held while Input Remapper restarts never sends its release, so "
+            "the compositor keeps it down for the whole session — in every "
+            "application, with and without Shift.\n\n"
+            "Key state belongs to the device that sent it, so the fix is to make "
+            "that device disconnect and come back. It will be unavailable for a "
+            "second or two.\n\nWhich device has the stuck key?",
+            choices, index, False)
+        if not ok:
+            return
+
+        targets = devices if choice == every else [choice]
+        switcher_was_up = (
+            systemctl("is-active", SERVICE, check_output=True) == "active")
+        if switcher_was_up:
+            systemctl("stop", SERVICE)
+        stop_injections()      # drop the grabs before the device goes away
+
+        parts, done, failed = [], [], []
+        # Whatever happens between here and the end, the switcher has to come
+        # back: leaving it stopped means nothing is remapped at all, and that
+        # looks exactly like the presets having broken.
+        try:
+            for name in targets:
+                good, message = reset_input_device(name)
+                (done if good else failed).append(message)
+            # Give the devices time to come back before anything grabs them.
+            time.sleep(2.5)
+
+            # Re-enumerating makes the driver re-attach, and the node that sends
+            # the key presses can come back as a different one. The presets then
+            # point at a node that is still perfectly live but silent, so every
+            # preset loads, injects, and remaps nothing. Check while the devices
+            # are still free.
+            for name in (targets if done else []):
+                repair = self.verify_device_node(name)
+                if repair:
+                    parts.append(repair)
+            if done:
+                parts.append("; ".join(done))
+            if failed:
+                parts.append("failed: " + "; ".join(failed))
+        finally:
+            if switcher_was_up:
+                code, out = systemctl("start", SERVICE)
+                # Confirm rather than assume: the start races with the devices
+                # coming back, and leaving the switcher down means no remapping
+                # at all until the user notices.
+                for _ in range(16):
+                    if systemctl("is-active", SERVICE,
+                                 check_output=True) == "active":
+                        break
+                    time.sleep(0.5)
+                else:
+                    code = code or 1
+                parts.append("auto-switch restarted" if code == 0
+                             else f"auto-switch start failed: {out}")
+                self.status.showMessage(" — ".join(parts), 20000)
+        self.status.showMessage(" — ".join(parts), 20000)
+        if failed and not done:
+            QMessageBox.warning(self, "Could not reset the device",
+                                "\n".join(failed))
+
+    def verify_device_node(self, device):
+        """Confirm a device's presets listen on the node it really sends from."""
+        if not hashes_used_by(device):
+            return ""          # nothing mapped for this device yet
+        dialog = IdentifyNode(device, self)
+        if not dialog.exec() or not dialog.origin_hash:
+            return "node check skipped"
+
+        used = hashes_used_by(device)
+        if set(used) == {dialog.origin_hash}:
+            return "presets already on the right node"
+
+        wrong = sum(n for h, n in used.items() if h != dialog.origin_hash)
+        answer = QMessageBox.question(
+            self, "Presets are on the wrong node",
+            f"{wrong} mapping(s) for “{device}” listen on a node that is no longer "
+            "the one it sends key presses from, so they would do nothing.\n\n"
+            "Point them at the right node? The originals are kept as .bak files.")
+        if answer != QMessageBox.StandardButton.Yes:
+            return f"{wrong} mapping(s) left on the wrong node"
+
+        changed, skipped, stamp = repoint_device_presets(device, dialog.origin_hash)
+        if not changed:
+            return "could not repoint any preset"
+        self.refresh_preset_lists()
+        total = sum(n for _name, n in changed)
+        message = (f"repointed {total} mapping(s) across {len(changed)} preset(s) "
+                   f"(backups .bak-{stamp})")
+        if skipped:
+            message += f" — {len(skipped)} left alone, the new node can't emit them"
+        return message
 
     def open_preset_editor(self, device, preset):
         """Open the preset editor, reached from the ✎ button on a row."""
