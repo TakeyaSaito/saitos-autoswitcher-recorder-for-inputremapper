@@ -380,122 +380,13 @@ def current_device_hashes():
         codes = {(ev_type, code) for ev_type, code_list in capabilities.items()
                  for code in code_list}
         found[digest] = {"name": device.name, "path": path, "codes": codes,
-                         "count": len(codes)}
+                         "count": len(codes), "phys": device.phys or "",
+                         "virtual": "input-remapper" in (device.phys or "")}
     return found
-
-
-def preset_paths(device):
-    directory = PRESET_DIR / device
-    return sorted(directory.glob("*.json")) if directory.is_dir() else []
-
-
-def analyze_presets(live=None):
-    """Find mappings pointing at device nodes that no longer exist.
-
-    Returns (findings, problems). Each finding is a dict describing one preset
-    file and the replacement hash chosen for it.
-    """
-    if live is None:
-        live = current_device_hashes()
-    if live is None:
-        return [], ["python-evdev is not installed — cannot inspect input devices"]
-
-    findings, problems = [], []
-    for device in known_devices():
-        # Hashes currently offered by nodes belonging to this device.
-        device_hashes = {h: info for h, info in live.items() if info["name"] == device}
-        if not device_hashes:
-            problems.append(f"“{device}” is not connected — skipped")
-            continue
-
-        # Ground truth: hashes the user's own healthy mappings already use.
-        healthy = {}
-        parsed = {}
-        for path in preset_paths(device):
-            try:
-                text = path.read_text()
-            except OSError as exc:
-                problems.append(f"{path.name}: unreadable ({exc})")
-                continue
-            if not text.strip():
-                continue  # Input Remapper leaves empty placeholder presets around
-            try:
-                data = json.loads(text)
-            except ValueError as exc:
-                problems.append(f"{path.name}: not valid JSON ({exc})")
-                continue
-            parsed[path] = data
-            for mapping in data if isinstance(data, list) else []:
-                for combo in mapping.get("input_combination", []) or []:
-                    digest = combo.get("origin_hash")
-                    if digest in device_hashes:
-                        healthy[digest] = healthy.get(digest, 0) + 1
-
-        for path, data in parsed.items():
-            stale = []
-            for mapping in data if isinstance(data, list) else []:
-                for combo in mapping.get("input_combination", []) or []:
-                    digest = combo.get("origin_hash")
-                    if digest and digest not in device_hashes:
-                        stale.append((combo.get("type"), combo.get("code"), digest))
-            if not stale:
-                continue
-
-            needed = {(t, c) for t, c, _h in stale if t is not None and c is not None}
-            candidates = [h for h, info in device_hashes.items()
-                          if needed <= info["codes"]]
-            if not candidates:
-                problems.append(
-                    f"{path.stem}: no connected node of “{device}” reports all of its "
-                    "keys — leaving it alone")
-                continue
-            # Prefer what the healthy mappings use, then the richest node.
-            candidates.sort(key=lambda h: (healthy.get(h, 0), device_hashes[h]["count"]),
-                            reverse=True)
-            replacement = candidates[0]
-            findings.append({
-                "device": device,
-                "preset": path.stem,
-                "path": path,
-                "count": len(stale),
-                "old": sorted({h for _t, _c, h in stale}),
-                "new": replacement,
-                "node": device_hashes[replacement]["path"],
-                "evidence": healthy.get(replacement, 0),
-            })
-    return findings, problems
 
 
 def backup_dir():
     return XDG_DATA_HOME / APP_NAME / "preset-backups"
-
-
-def apply_hash_fix(finding):
-    """Rewrite one preset's stale origin_hash values. (ok, message)."""
-    path, replacement = finding["path"], finding["new"]
-    try:
-        data = json.loads(path.read_text())
-    except (OSError, ValueError) as exc:
-        return False, f"{finding['preset']}: {exc}"
-
-    changed = 0
-    for mapping in data if isinstance(data, list) else []:
-        for combo in mapping.get("input_combination", []) or []:
-            if combo.get("origin_hash") in finding["old"]:
-                combo["origin_hash"] = replacement
-                changed += 1
-    if not changed:
-        return False, f"{finding['preset']}: nothing to change"
-
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    target = backup_dir() / finding["device"]
-    try:
-        target.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(path, target / f"{path.name}.{stamp}")
-        path.write_text(json.dumps(data, indent=4))
-    except OSError as exc:
-        return False, f"{finding['preset']}: {exc}"
-    return True, f"{finding['preset']}: {changed} mapping(s) repaired"
 
 
 def trash_dir():
@@ -668,19 +559,29 @@ def release_all_keys():
     return released
 
 
-# Re-enumerating a device is the only way to clear a key the compositor still
-# believes is held. USBDEVFS_RESET, from linux/usbdevice_fs.h.
-USB_RESET_IOCTL = (ord("U") << 8) | 20
-USB_RESET_SCRIPT = (
-    "import fcntl, sys\n"
-    "fcntl.ioctl(open(sys.argv[1], 'wb'), %d, 0)\n" % USB_RESET_IOCTL)
+# Clearing a key the compositor still believes is held means the evdev node it
+# came from has to go away and come back. USBDEVFS_RESET does not do that: it
+# port-resets the device and then re-binds the same drivers to the same
+# interfaces, so /dev/input/eventNN survives with its number and capabilities
+# unchanged — measured here, and the stuck key survives with it. Unbinding the
+# USB device and binding it again does destroy and recreate the interfaces.
+USB_REBIND_SCRIPT = (
+    "import sys, time\n"
+    "d = '/sys/bus/usb/drivers/usb/'\n"
+    "try:\n"
+    "    open(d + 'unbind', 'w').write(sys.argv[1])\n"
+    "    time.sleep(1.0)\n"
+    "finally:\n"
+    # Always bind back. A device left unbound is gone until it is replugged,
+    # which is a far worse outcome than a key that is still stuck.
+    "    open(d + 'bind', 'w').write(sys.argv[1])\n")
 
 
-def usb_address_for(device_name):
-    """(bus, device) of the USB device behind an input device, or None.
+def usb_sysfs_id_for(device_name):
+    """The USB device's sysfs name behind an input device ("1-5.1"), or None.
 
     Climbs from the device's /sys entry until it reaches the USB device that
-    owns it — the event node itself carries no bus or device number.
+    owns it — the event node itself sits several levels below.
     """
     for path, _digest in device_nodes(device_name):
         node = Path("/sys/class/input") / Path(path).name / "device"
@@ -691,9 +592,8 @@ def usb_address_for(device_name):
         for _ in range(8):
             try:
                 if (node / "idVendor").exists():
-                    return (int((node / "busnum").read_text()),
-                            int((node / "devnum").read_text()))
-            except (OSError, ValueError):
+                    return node.name
+            except OSError:
                 break
             node = node.parent
     return None
@@ -708,17 +608,17 @@ def reset_input_device(device_name):
     cannot release it on the real one's behalf; only the device itself can, and
     re-enumerating it is what makes the compositor drop the state.
     """
-    address = usb_address_for(device_name)
-    if address is None:
+    usb_id = usb_sysfs_id_for(device_name)
+    if usb_id is None:
         return False, f"“{device_name}” is not on USB, or has gone away"
-    path = "/dev/bus/usb/%03d/%03d" % address
     code, out, how = run_privileged(
-        [sys.executable or "python3", "-c", USB_RESET_SCRIPT, path])
+        [sys.executable or "python3", "-c", USB_REBIND_SCRIPT, usb_id])
     if code == 0:
-        return True, f"reset “{device_name}”"
+        return True, f"re-enumerated “{device_name}”"
     if how == "denied":
         return False, f"“{device_name}”: authorization declined"
-    return False, f"“{device_name}”: {(out or '').strip().splitlines()[-1] if out else 'reset failed'}"
+    return False, (f"“{device_name}”: "
+                   f"{(out or '').strip().splitlines()[-1] if out else 'reset failed'}")
 
 
 def presets_for_device_paths(device):
@@ -727,77 +627,6 @@ def presets_for_device_paths(device):
     if not directory.is_dir():
         return []
     return [f for f in sorted(directory.glob("*.json")) if f.stat().st_size]
-
-
-def hashes_used_by(device):
-    """{origin hash: how many mappings use it} across a device's presets."""
-    counts = {}
-    for f in presets_for_device_paths(device):
-        try:
-            data = json.loads(f.read_text())
-        except (OSError, ValueError):
-            continue
-        for mapping in (data if isinstance(data, list) else data.get("mappings", [])):
-            for config in (mapping.get("input_combination") or []):
-                digest = config.get("origin_hash")
-                if digest:
-                    counts[digest] = counts.get(digest, 0) + 1
-    return counts
-
-
-def repoint_device_presets(device, new_hash):
-    """Bind a device's mappings to the node that actually emits their keys.
-
-    A preset stores the origin hash of the node it listens on. That hash can
-    stay perfectly valid while no longer being the node the device sends key
-    presses from — re-enumerating the device makes its driver re-attach, and the
-    keypad can come back on a different interface. The mappings then match
-    nothing: the preset loads, the daemon injects, and every key falls through
-    unremapped. Only codes the new node can actually emit are moved.
-
-    Returns (changed_presets, skipped_codes, backup_stamp).
-    """
-    try:
-        import evdev
-    except ImportError:
-        return [], [], ""
-    live = current_device_hashes() or {}
-    if new_hash not in live:
-        return [], [], ""
-    try:
-        node = evdev.InputDevice(live[new_hash]["path"])
-        emits = set(node.capabilities().get(evdev.ecodes.EV_KEY, []))
-        node.close()
-    except OSError:
-        return [], [], ""
-
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    changed, skipped = [], []
-    for f in presets_for_device_paths(device):
-        original = f.read_text()
-        try:
-            data = json.loads(original)
-        except ValueError:
-            continue
-        moved = 0
-        for mapping in (data if isinstance(data, list) else data.get("mappings", [])):
-            for config in (mapping.get("input_combination") or []):
-                digest = config.get("origin_hash")
-                if not digest or digest == new_hash:
-                    continue
-                if config.get("code") in emits:
-                    config["origin_hash"] = new_hash
-                    moved += 1
-                else:
-                    skipped.append(f"{f.stem}: code {config.get('code')}")
-        if moved:
-            try:
-                f.with_name(f"{f.name}.bak-{stamp}").write_text(original)
-                f.write_text(json.dumps(data, indent=4))
-            except OSError:
-                continue
-            changed.append((f.stem, moved))
-    return changed, skipped, stamp
 
 
 def clear_squatters():
@@ -1194,6 +1023,137 @@ def device_nodes(device_name):
     live = current_device_hashes() or {}
     return [(info["path"], digest) for digest, info in live.items()
             if info["name"] == device_name]
+
+
+def device_node_capabilities(device_name):
+    """{origin hash: {(type, code), ...}} for a device's real nodes.
+
+    input-remapper's own forwarding devices carry the *same* name as the device
+    they stand in for, so matching on the name alone picks those up too. They
+    exist only while an injection is running, which makes a preset bound to one
+    dead the moment injection stops — they are excluded here.
+    """
+    live = current_device_hashes() or {}
+    return {digest: info["codes"] for digest, info in live.items()
+            if info["name"] == device_name and not info.get("virtual")}
+
+
+def mirror_preset_data(data, node_caps):
+    """Write each mapping once per node that can report it. (data, added).
+
+    Which /dev/input node a device sends its key presses from is not stable
+    across reboots — the same keypad was measured on input1 one boot and input0
+    the next — and a mapping only fires on the node named by its origin_hash.
+    Storing a copy per node makes the preset match whichever one is emitting;
+    the copies on the other nodes simply never fire.
+
+    Only nodes that advertise every code of the combination get a copy, and that
+    restriction is load-bearing rather than tidiness. Injector._find_input_device
+    accepts a node only if it both matches the hash *and* reports the code; when
+    it fails, input-remapper rewrites that mapping's origin_hash onto a node
+    picked by its own fallback ranking. With copies already present that rewrite
+    lands on one that exists and raises KeyError, killing the whole injection.
+
+    The whole combination is copied per node rather than each config
+    independently: every key of a combination comes from one device node, so
+    this is len(nodes) copies, not a product.
+    """
+    if not node_caps:
+        return data, 0
+    out, seen, written = [], set(), 0
+    for mapping in (data if isinstance(data, list) else []):
+        combination = mapping.get("input_combination") or []
+        needed = {(c.get("type"), c.get("code")) for c in combination
+                  if c.get("type") is not None and c.get("code") is not None}
+        candidates = [d for d, codes in sorted(node_caps.items())
+                      if needed and needed <= codes]
+        if not combination or not candidates:
+            key = json.dumps(mapping, sort_keys=True)
+            if key not in seen:
+                seen.add(key)
+                out.append(mapping)
+                written += 1
+            continue
+        for digest in candidates:
+            copy = json.loads(json.dumps(mapping))
+            for config in copy.get("input_combination") or []:
+                config["origin_hash"] = digest
+            key = json.dumps(copy, sort_keys=True)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(copy)
+            written += 1
+    return out, max(0, written - len(data))
+
+
+def mirror_preset_file(path, device, node_caps=None):
+    """Expand one preset on disk so it covers every node that can report it."""
+    if node_caps is None:
+        node_caps = device_node_capabilities(device)
+    if not node_caps:
+        return 0
+    try:
+        data = json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return 0
+    data, added = mirror_preset_data(data, node_caps)
+    if not added:
+        return 0
+    try:
+        Path(path).write_text(json.dumps(data, indent=4))
+    except OSError:
+        return 0
+    return added
+
+
+def mirror_device_presets(device):
+    """Make every preset of a device boot-proof. (changed, added, stamp)."""
+    node_caps = device_node_capabilities(device)
+    if not node_caps:
+        return [], 0, ""
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    changed, added = [], 0
+    for f in presets_for_device_paths(device):
+        try:
+            original = f.read_text()
+        except OSError:
+            continue
+        backup = backup_dir() / device
+        try:
+            backup.mkdir(parents=True, exist_ok=True)
+            (backup / f"{f.name}.{stamp}").write_text(original)
+        except OSError:
+            continue
+        n = mirror_preset_file(f, device, node_caps)
+        if n:
+            changed.append((f.stem, n))
+            added += n
+    return changed, added, stamp
+
+
+def collapse_mirrored(mappings):
+    """Fold per-node copies back into one entry each, for display and editing.
+
+    Copies that differ only by origin_hash are one logical mapping; anything
+    that differs in output is left alone, so a genuinely per-node mapping is
+    never silently merged away.
+    """
+    kept, seen = [], set()
+    for mapping in mappings:
+        try:
+            combination = [(c.type, c.code, getattr(c, "analog_threshold", None))
+                           for c in mapping.input_combination]
+            rest = mapping.dict(exclude={"input_combination"})
+            key = repr((combination, sorted(rest.items(), key=lambda kv: kv[0])))
+        except Exception:
+            kept.append(mapping)
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        kept.append(mapping)
+    return kept
 
 
 def event_label(ev_type, code):
@@ -2594,7 +2554,7 @@ class PresetEditor(QDialog):
         try:
             loaded = self.api["Preset"](path, mapping_factory=self.api["UIMapping"])
             loaded.load()
-            self.mappings = list(loaded)
+            self.mappings = collapse_mirrored(list(loaded))
         except Exception as exc:
             self.error_label.setText(f"<span style='color:#d13438'>{exc}</span>")
         self.refresh_list()
@@ -3061,6 +3021,11 @@ class PresetEditor(QDialog):
                     duplicates.append(
                         " + ".join(key_name(c.code) for c in mapping.input_combination))
             preset.save()
+            # Expansion is a storage detail: everything above this line works
+            # with one mapping per key, and save() fans it out across the
+            # device's nodes so whichever one emits after a reboot still
+            # matches. See mirror_preset_data.
+            mirror_preset_file(path, self.device)
         except Exception as exc:
             QMessageBox.critical(self, "Could not save", str(exc))
             return
@@ -3177,102 +3142,6 @@ class PresetCell(QWidget):
 
     def setCurrentText(self, text):
         self.combo.setCurrentText(text)
-
-
-class IdentifyNode(QDialog):
-    """Ask for one key press and report which node of a device sent it.
-
-    There is no way to work this out from the device alone: several of a
-    device's nodes can advertise the same key codes, and only one of them
-    actually sends them. Watching a real press is the only reliable answer, and
-    it is the evidence that identifies a preset bound to the wrong node.
-    """
-
-    def __init__(self, device, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Which key?")
-        self.device = device
-        self.origin_hash = None
-        self._devices = []
-
-        layout = QVBoxLayout(self)
-        label = QLabel(
-            f"Press any key on <b>{device}</b> — one you have mapped.<br><br>"
-            "This identifies which of the device's nodes actually sends your key "
-            "presses, so the presets can be pointed at it. Nothing is recorded.")
-        label.setWordWrap(True)
-        layout.addWidget(label)
-        self.status = QLabel("<b style='color:#d13438'>● waiting for a key</b>")
-        layout.addWidget(self.status)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
-        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("Skip this check")
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
-
-        self._open()
-        self._remaining = 30
-        self._timer = QTimer(self)
-        self._timer.timeout.connect(self._tick)
-        self._timer.start(1000)
-
-    def _open(self):
-        """Read every node of this device — never grabbing, so keys still work."""
-        try:
-            import evdev
-        except ImportError:
-            self.status.setText("python-evdev is not installed.")
-            return
-        from PyQt6.QtCore import QSocketNotifier
-        for path, digest in device_nodes(self.device):
-            try:
-                device = evdev.InputDevice(path)
-            except OSError:
-                continue
-            notifier = QSocketNotifier(device.fd, QSocketNotifier.Type.Read, self)
-            notifier.activated.connect(
-                lambda _s, d=device, h=digest: self._read(d, h))
-            self._devices.append((device, notifier))
-        if not self._devices:
-            self.status.setText(
-                "<b style='color:#d13438'>None of this device's nodes could be "
-                "read.</b>")
-
-    def _read(self, device, digest):
-        import evdev
-        try:
-            events = list(device.read())
-        except OSError:
-            return
-        for event in events:
-            if event.type == evdev.ecodes.EV_KEY and event.value == 1:
-                self.origin_hash = digest
-                self.accept()
-                return
-
-    def _tick(self):
-        self._remaining -= 1
-        if self._remaining <= 0:
-            self.reject()
-            return
-        self.status.setText("<b style='color:#d13438'>● waiting for a key</b> "
-                            f"<i>({self._remaining}s)</i>")
-
-    def closeEvent(self, event):
-        self._timer.stop()
-        for device, notifier in self._devices:
-            notifier.setEnabled(False)
-            device.close()
-        self._devices = []
-        super().closeEvent(event)
-
-    def reject(self):
-        self.close()
-        super().reject()
-
-    def accept(self):
-        self.close()
-        super().accept()
 
 
 class SteamPicker(QDialog):
@@ -3508,7 +3377,6 @@ class MainWindow(QMainWindow):
 
         self.status = self.statusBar()
         self.load_config()
-        self.refresh_fix_indicator()
         self.warn_about_other_configs()
 
         self.table.setMinimumHeight(240)   # ~7 rows, so the minimum stays usable
@@ -3601,11 +3469,6 @@ class MainWindow(QMainWindow):
             "Open, create and repair presets — for any device, including ones with "
             "no mappings yet.")
         row.addWidget(self.presets_button)
-
-        self.fix_button = QPushButton("Fix profile assignments…")
-        self.fix_button_text = "Fix profile assignments…"
-        self.fix_button.clicked.connect(self.fix_assignments)
-        row.addWidget(self.fix_button)
 
         # Deliberately a button and not a menu entry: when a key is stuck you
         # may not be able to type, so this has to be findable in one click.
@@ -3939,7 +3802,6 @@ class MainWindow(QMainWindow):
             self.table.setCellWidget(r, 1, self._preset_combo(device, preset))
         self.rewire_all()
         self.validate()
-        self.refresh_fix_indicator()
 
     def create_presets_for_selection(self):
         """Copy a chosen preset to the name of every selected row that lacks one."""
@@ -3989,71 +3851,6 @@ class MainWindow(QMainWindow):
             "Save config.txt and restart it plus the auto-switch service now?")
         return answer == QMessageBox.StandardButton.Yes
 
-    def refresh_fix_indicator(self):
-        """Flag the fix button when presets point at a device that isn't there.
-
-        Cheap enough to run on every preset change: it reads the preset files and
-        enumerates evdev, both of which are local and small.
-        """
-        try:
-            findings, _problems = analyze_presets()
-        except Exception:  # never let a broken scan stop the GUI from opening
-            return
-        button = getattr(self, "fix_button", None)
-        if button is None:
-            return
-
-        if findings:
-            broken = sum(f["count"] for f in findings)
-            button.setText(f"⚠ {self.fix_button_text}  ({len(findings)})")
-            button.setStyleSheet(
-                "QPushButton { background-color:#d13438; color:white; font-weight:bold; }"
-                "QPushButton:hover { background-color:#e14b4f; }")
-            button.setToolTip(
-                f"{broken} mapping(s) in {len(findings)} preset(s) point at an input "
-                "device that is no longer connected, so those keys do nothing:\n\n"
-                + "\n".join(f"  • {f['preset']} ({f['count']})" for f in findings[:10])
-                + "\n\nClick to repair them.")
-            self.status.showMessage(
-                f"⚠ {broken} mapping(s) in {len(findings)} preset(s) are pointing at a "
-                "device that no longer exists — use “Fix profile assignments”", 30000)
-        else:
-            button.setText(self.fix_button_text)
-            button.setStyleSheet("")
-            button.setToolTip(
-                "Scan presets for mappings recorded against a device node that no "
-                "longer exists.")
-
-    def fix_assignments(self):
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            findings, problems = analyze_presets()
-        finally:
-            QApplication.restoreOverrideCursor()
-
-        dialog = FixAssignmentsDialog(findings, problems, self)
-        if not dialog.exec():
-            return
-        chosen = dialog.selected()
-        if not chosen:
-            return
-
-        fixed, failed = [], []
-        for finding in chosen:
-            ok, message = apply_hash_fix(finding)
-            (fixed if ok else failed).append(message)
-
-        parts = [f"Repaired {len(fixed)} preset(s)"]
-        if failed:
-            parts.append(f"{len(failed)} failed: " + "; ".join(failed[:3]))
-        if fixed:
-            # Always restart: the daemon only reads presets at injection time and
-            # the switcher caches the last profile it applied, so without this the
-            # repair sits on disk doing nothing.
-            parts.append(self.run_reload())
-        self.refresh_fix_indicator()
-        self.status.showMessage(" — ".join(parts), 25000)
-
     @guard
     def unstick_keys(self):
         """Re-enumerate a device to release a key the compositor thinks is held."""
@@ -4097,15 +3894,11 @@ class MainWindow(QMainWindow):
             # Give the devices time to come back before anything grabs them.
             time.sleep(2.5)
 
-            # Re-enumerating makes the driver re-attach, and the node that sends
-            # the key presses can come back as a different one. The presets then
-            # point at a node that is still perfectly live but silent, so every
-            # preset loads, injects, and remaps nothing. Check while the devices
-            # are still free.
-            for name in (targets if done else []):
-                repair = self.verify_device_node(name)
-                if repair:
-                    parts.append(repair)
+            # Nothing is repointed here any more. Which node a device sends key
+            # presses from varies between boots, so a reading taken now is only
+            # true for this one; writing it into the presets is what used to
+            # leave every mapping stranded after the next reboot. Presets carry
+            # a copy per node instead — see mirror_preset_data.
             if done:
                 parts.append("; ".join(done))
             if failed:
@@ -4130,38 +3923,6 @@ class MainWindow(QMainWindow):
         if failed and not done:
             QMessageBox.warning(self, "Could not reset the device",
                                 "\n".join(failed))
-
-    def verify_device_node(self, device):
-        """Confirm a device's presets listen on the node it really sends from."""
-        if not hashes_used_by(device):
-            return ""          # nothing mapped for this device yet
-        dialog = IdentifyNode(device, self)
-        if not dialog.exec() or not dialog.origin_hash:
-            return "node check skipped"
-
-        used = hashes_used_by(device)
-        if set(used) == {dialog.origin_hash}:
-            return "presets already on the right node"
-
-        wrong = sum(n for h, n in used.items() if h != dialog.origin_hash)
-        answer = QMessageBox.question(
-            self, "Presets are on the wrong node",
-            f"{wrong} mapping(s) for “{device}” listen on a node that is no longer "
-            "the one it sends key presses from, so they would do nothing.\n\n"
-            "Point them at the right node? The originals are kept as .bak files.")
-        if answer != QMessageBox.StandardButton.Yes:
-            return f"{wrong} mapping(s) left on the wrong node"
-
-        changed, skipped, stamp = repoint_device_presets(device, dialog.origin_hash)
-        if not changed:
-            return "could not repoint any preset"
-        self.refresh_preset_lists()
-        total = sum(n for _name, n in changed)
-        message = (f"repointed {total} mapping(s) across {len(changed)} preset(s) "
-                   f"(backups .bak-{stamp})")
-        if skipped:
-            message += f" — {len(skipped)} left alone, the new node can't emit them"
-        return message
 
     def open_preset_editor(self, device, preset):
         """Open the preset editor, reached from the ✎ button on a row."""
