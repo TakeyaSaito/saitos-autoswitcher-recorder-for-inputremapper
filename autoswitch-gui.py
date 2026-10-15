@@ -1441,40 +1441,150 @@ def split_trailing_wait(text):
     return (text[:match.start()], int(match.group(1))) if match else (text, None)
 
 
-# The two Input Remapper wrappers that loop their body. hold(...) runs while the
-# trigger key is down; toggle(...) starts on one press and stops on the next, so
-# the key doesn't have to be held. Order matters only for the combo box.
-LOOP_MODES = ("hold", "toggle")
+# The ways the output can loop. hold(...) runs while the trigger key is down;
+# toggle(...) starts on one press and stops on the next, so the key doesn't have
+# to be held. turbo is not a wrapper of its own but a pattern built from hold():
+# `X.wait(initial).hold(X.wait(rate))` fires once, and if the key is still down
+# after the initial delay, keeps firing at the rate — hold() checks the key
+# before each pass, so a quick tap fires exactly once. Order matters only for
+# the combo box.
+LOOP_MODES = ("hold", "toggle", "turbo")
+WRAPPER_MODES = ("hold", "toggle")
 
 
-def build_output(base, mode, delay_ms=None):
+# key(X) and hold_keys(A, B) as whole steps. The lookbehind keeps key( from
+# matching inside hold_keys( or key_down(.
+WHOLE_PRESS_RE = re.compile(r"(?<!\w)(key|hold_keys)\(([^()]*)\)")
+# key_down(A).key_down(B).wait(H).key_up(B).key_up(A) — a split press or chord.
+SPLIT_PRESS_RE = re.compile(
+    r"((?:key_down\([^()]*\)\.)+)(?:wait|w)\((\d+)\)((?:\.key_up\([^()]*\))+)")
+STEP_ARG_RE = re.compile(r"key_(?:down|up)\(([^()]*)\)")
+
+
+def split_presses(text, held_ms):
+    """Turn every key(X) into key_down(X).wait(held).key_up(X).
+
+    Some games miss a key() press because its down and up land in the same
+    frame; holding it for a set time fixes that. Chords get the same treatment,
+    released in reverse order.
+    """
+    def expand(match):
+        keys = [k.strip() for k in match.group(2).split(",") if k.strip()]
+        if not keys:
+            return match.group(0)
+        downs = "".join(f"key_down({k})." for k in keys)
+        ups = "".join(f".key_up({k})" for k in reversed(keys))
+        return f"{downs}wait({held_ms}){ups}"
+    return WHOLE_PRESS_RE.sub(expand, text)
+
+
+def _split_groups(text):
+    """(match, keys, held ms) for each split press whose ups mirror its downs."""
+    for match in SPLIT_PRESS_RE.finditer(text):
+        downs = [k.strip() for k in STEP_ARG_RE.findall(match.group(1))]
+        ups = [k.strip() for k in STEP_ARG_RE.findall(match.group(3))]
+        if ups == downs[::-1]:
+            yield match, downs, int(match.group(2))
+
+
+def join_presses(text, held_ms):
+    """Undo split_presses for the presses held exactly `held_ms`."""
+    out, last = [], 0
+    for match, keys, held in _split_groups(text):
+        if held != held_ms:
+            continue
+        out.append(text[last:match.start()])
+        out.append(f"key({keys[0]})" if len(keys) == 1
+                   else "hold_keys(" + ", ".join(keys) + ")")
+        last = match.end()
+    return "".join(out) + text[last:]
+
+
+def split_press_ms(text):
+    """The held time when every press in `text` is a split one, else None.
+
+    Only an output made entirely of split presses with one shared held time
+    counts, so a recorded macro with real, varying hold times is left alone.
+    """
+    helds = {held for _m, _k, held in _split_groups(text or "")}
+    if len(helds) != 1:
+        return None
+    held = helds.pop()
+    rest = join_presses(text, held)
+    if "key_down(" in rest or "key_up(" in rest:
+        return None
+    return held
+
+
+def build_output(base, mode, delay_ms=None, initial_ms=None, press_ms=None):
     """Assemble the output symbol from its parts.
 
     `mode` is one of LOOP_MODES, or None for no looping. A wait at the end of
     the loop body is what stops it repeating as fast as the CPU allows.
+    `initial_ms` is turbo's pause between the first press and the repeats.
+    `press_ms` splits each key press into key_down/key_up held that long.
     """
     base = (base or "").strip()
     if not base:
         return ""
     if mode not in LOOP_MODES:
-        return base
+        if not press_ms:
+            return base
+        return split_presses(base if "(" in base else f"key({base})", press_ms)
     # Any trailing wait is the loop delay's, so drop it before adding the
     # current one — otherwise editing a macro stacks a second wait each pass.
     base, _existing = split_trailing_wait(base)
     inner = base if "(" in base else f"key({base})"
-    if delay_ms:
-        inner = f"{inner}.wait({delay_ms})"
-    return f"{mode}({inner})"
+    if press_ms:
+        inner = split_presses(inner, press_ms)
+    body = f"{inner}.wait({delay_ms})" if delay_ms else inner
+    if mode == "turbo":
+        first = f"{inner}.wait({initial_ms})" if initial_ms else inner
+        return f"{first}.hold({body})"
+    return f"{mode}({body})"
+
+
+def split_turbo(text):
+    """(repeated body with its wait, initial delay in ms or None) for a turbo
+    output, or None when `text` isn't one.
+
+    Turbo is `X.wait(N).hold(X.wait(M))`: a trailing .hold(...) at the top level
+    whose body, minus its wait, is exactly what runs before it.
+    """
+    text = (text or "").strip()
+    if not text.endswith(")"):
+        return None
+    for match in re.finditer(r"\.hold\(", text):
+        start = match.start()
+        if text[:start].count("(") != text[:start].count(")"):
+            continue  # nested inside something else
+        depth = 0
+        for index in range(match.end() - 1, len(text)):
+            if text[index] == "(":
+                depth += 1
+            elif text[index] == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+        if index != len(text) - 1:
+            continue  # this hold() is followed by more steps
+        first, initial = split_trailing_wait(text[:start])
+        body = text[match.end():-1].strip()
+        if first.strip() and first.strip() == split_trailing_wait(body)[0].strip():
+            return body, initial
+    return None
 
 
 def loop_mode_of(text):
-    """'hold', 'toggle' or None — the wrapper covering the whole expression.
+    """'hold', 'toggle', 'turbo' or None — how the whole expression loops.
 
     Only a wrapper whose opening bracket closes at the very end counts, so
     `hold(a).key(b)` is not treated as a loop.
     """
     text = (text or "").strip()
-    for mode in LOOP_MODES:
+    if split_turbo(text):
+        return "turbo"
+    for mode in WRAPPER_MODES:
         # hold_keys(...) is a different function; the "(" in the prefix excludes it.
         if not text.startswith(f"{mode}(") or not text.endswith(")"):
             continue
@@ -1492,15 +1602,26 @@ def loop_mode_of(text):
 
 
 def is_looped(text):
-    """True when the output is wrapped in hold(...) or toggle(...)."""
+    """True when the output is a hold(...), toggle(...) or turbo loop."""
     return loop_mode_of(text) is not None
 
 
 def unwrap_loop(text):
-    """Strip an enclosing hold(...)/toggle(...), leaving the loop body."""
+    """Strip an enclosing hold(...)/toggle(...), leaving the loop body.
+
+    For turbo that is the repeated part, which carries the fire-rate wait.
+    """
     text = (text or "").strip()
     mode = loop_mode_of(text)
+    if mode == "turbo":
+        return split_turbo(text)[0]
     return text[len(mode) + 1:-1].strip() if mode else text
+
+
+def turbo_initial_delay(text):
+    """Turbo's initial delay in ms, or None (also for any other output)."""
+    turbo = split_turbo(text)
+    return turbo[1] if turbo else None
 
 
 MACRO_STEP_RE = re.compile(r"(key_down|key_up|key|wait|hold_keys|event)\(([^)]*)\)")
@@ -2414,15 +2535,30 @@ class PresetEditor(QDialog):
         hold_row.addWidget(self.hold_check)
         self.loop_mode_combo = QComboBox()
         self.loop_mode_combo.addItems(["while the input key is held  (hold)",
-                                       "until the key is pressed again  (toggle)"])
+                                       "until the key is pressed again  (toggle)",
+                                       "turbo: once, then repeat while held"])
         self.loop_mode_combo.setToolTip(
             "hold(…) repeats only while you keep the key down.\n"
             "toggle(…) starts on one press and stops on the next, so the key "
-            "does not have to be held.")
-        self.loop_mode_combo.currentIndexChanged.connect(
-            lambda _i: self.rebuild_output())
+            "does not have to be held.\n"
+            "Turbo sends the output once; if the key is still down after the "
+            "initial delay it keeps firing at the fire rate until released.")
+        self.loop_mode_combo.currentIndexChanged.connect(self.loop_mode_changed)
         hold_row.addWidget(self.loop_mode_combo)
-        hold_row.addWidget(QLabel("loop delay:"))
+        self.turbo_delay_label = QLabel("initial delay:")
+        hold_row.addWidget(self.turbo_delay_label)
+        self.turbo_delay_field = QLineEdit()
+        self.turbo_delay_field.setFixedWidth(70)
+        self.turbo_delay_field.setPlaceholderText("ms")
+        self.turbo_delay_field.setToolTip(
+            "How long the key has to stay down after the first press before "
+            "turbo starts repeating it.")
+        self.turbo_delay_field.textEdited.connect(lambda _t: self.rebuild_output())
+        hold_row.addWidget(self.turbo_delay_field)
+        self.turbo_delay_unit = QLabel("ms")
+        hold_row.addWidget(self.turbo_delay_unit)
+        self.loop_delay_label = QLabel("loop delay:")
+        hold_row.addWidget(self.loop_delay_label)
         self.loop_delay_field = QLineEdit()
         self.loop_delay_field.setFixedWidth(70)
         self.loop_delay_field.setPlaceholderText("ms")
@@ -2434,6 +2570,28 @@ class PresetEditor(QDialog):
         hold_row.addWidget(QLabel("ms"))
         hold_row.addStretch(1)
         inner.addLayout(hold_row)
+
+        press_row = QHBoxLayout()
+        self.press_check = QCheckBox("Separate key_down / key_up — held for:")
+        self.press_check.setToolTip(
+            "Send each key press as key_down(…).wait(…).key_up(…) instead of "
+            "key(…).\nSome games miss a key(…) press because it goes down and "
+            "up within one frame; holding it for a few ms fixes that.\n"
+            "Works with every loop mode, turbo included.")
+        self.press_check.toggled.connect(self.toggle_press)
+        press_row.addWidget(self.press_check)
+        self.press_field = QLineEdit()
+        self.press_field.setFixedWidth(70)
+        self.press_field.setPlaceholderText("ms")
+        self.press_field.setToolTip("How long each key stays down.")
+        self.press_field.textEdited.connect(lambda _t: self.rebuild_output())
+        press_row.addWidget(self.press_field)
+        press_row.addWidget(QLabel("ms"))
+        press_row.addStretch(1)
+        inner.addLayout(press_row)
+        # The held time currently written into the output, so it can be taken
+        # back out when the time changes or the box is unticked.
+        self.press_applied = None
 
         combos = QHBoxLayout()
         combos.addWidget(QLabel("Sends to:"))
@@ -2600,7 +2758,7 @@ class PresetEditor(QDialog):
         for widget in (self.input_field, self.output_field, self.record_input,
                        self.record_output, self.target_combo, self.type_combo,
                        self.output_type, self.output_code, self.hold_check,
-                       self.loop_mode_combo, self.record_key):
+                       self.loop_mode_combo, self.record_key, self.press_check):
             widget.setEnabled(enabled)
         if mapping is None:
             self.input_field.clear(); self.output_field.clear()
@@ -2620,6 +2778,14 @@ class PresetEditor(QDialog):
         _base, loop_delay = split_trailing_wait(unwrap_loop(symbol)) if mode \
             else (symbol, None)
         self.loop_delay_field.setText("" if loop_delay is None else str(loop_delay))
+        initial = turbo_initial_delay(symbol)
+        self.turbo_delay_field.setText("" if initial is None else str(initial))
+        self.show_turbo_fields()
+        self.press_applied = split_press_ms(symbol)
+        self.press_check.setChecked(self.press_applied is not None)
+        self.press_field.setText(
+            "" if self.press_applied is None else str(self.press_applied))
+        self.press_field.setEnabled(self.press_applied is not None)
         self.target_combo.setCurrentText(mapping.target_uinput or "keyboard")
         # mapping_type comes back as an enum or a plain string depending on how
         # the preset was written, so accept either.
@@ -2833,7 +2999,9 @@ class PresetEditor(QDialog):
         if not text:
             return
         self.output_field.setText(
-            build_output(text, self.loop_mode(), self.loop_delay_ms()))
+            build_output(text, self.loop_mode(), self.loop_delay_ms(),
+                         self.turbo_delay_ms(), self.press_ms()))
+        self.press_applied = self.press_ms()
         self.pull_form()
 
     @guard
@@ -2860,6 +3028,9 @@ class PresetEditor(QDialog):
             base, _delay = split_trailing_wait(unwrap_loop(current))
         else:
             base = current
+        # Show the presses as plain steps; they are split again on the way back.
+        if self.press_applied:
+            base = join_presses(base, self.press_applied)
 
         self.pause_for_recording()
         try:
@@ -2874,15 +3045,37 @@ class PresetEditor(QDialog):
             return
         # Keep whatever the loop tick, its mode and its delay were set to.
         self.output_field.setText(
-            build_output(text, self.loop_mode(), self.loop_delay_ms()))
+            build_output(text, self.loop_mode(), self.loop_delay_ms(),
+                         self.turbo_delay_ms(), self.press_ms()))
+        self.press_applied = self.press_ms()
         self.pull_form()
 
     def loop_delay_ms(self):
         text = self.loop_delay_field.text().strip()
         return max(1, min(int(text), 60_000)) if text.isdigit() else None
 
+    def press_ms(self):
+        """Held time for split key presses, or None when the box is unticked."""
+        if not self.press_check.isChecked():
+            return None
+        text = self.press_field.text().strip()
+        return max(1, min(int(text), 60_000)) if text.isdigit() else None
+
+    @guard
+    def toggle_press(self, checked):
+        self.press_field.setEnabled(checked)
+        if self.loading:
+            return
+        if checked and not self.press_field.text().strip():
+            self.press_field.setText("30")
+        self.rebuild_output()
+
+    def turbo_delay_ms(self):
+        text = self.turbo_delay_field.text().strip()
+        return max(1, min(int(text), 60_000)) if text.isdigit() else None
+
     def loop_mode(self):
-        """'hold', 'toggle' or None — what the Loop row is currently asking for."""
+        """'hold', 'toggle', 'turbo' or None — what the Loop row is asking for."""
         if not self.hold_check.isChecked():
             return None
         return LOOP_MODES[self.loop_mode_combo.currentIndex()]
@@ -2897,14 +3090,52 @@ class PresetEditor(QDialog):
         # looped. On an unlooped macro it is an ordinary step, and stripping it
         # here silently deleted it as soon as the delay field was touched.
         base = split_trailing_wait(unwrap_loop(text))[0] if is_looped(text) else text
-        rebuilt = build_output(base, self.loop_mode(), self.loop_delay_ms())
+        press = self.press_ms()
+        if self.press_applied:
+            base = join_presses(base, self.press_applied)
+            # Unticking a single unlooped key gives back the plain key mapping
+            # it started as, not a one-step key() macro.
+            single = re.fullmatch(r"key\(([^()]*)\)", base.strip())
+            if single and not press and self.loop_mode() is None:
+                base = single.group(1).strip()
+        rebuilt = build_output(base, self.loop_mode(), self.loop_delay_ms(),
+                               self.turbo_delay_ms(), press)
+        self.press_applied = press
         if rebuilt != self.output_field.text():
             self.output_field.setText(rebuilt)
         self.pull_form()
 
+    def show_turbo_fields(self):
+        """The initial delay only exists for turbo, where the loop delay is the
+        fire rate."""
+        turbo = self.loop_mode_combo.currentIndex() == LOOP_MODES.index("turbo")
+        for widget in (self.turbo_delay_label, self.turbo_delay_field,
+                       self.turbo_delay_unit):
+            widget.setVisible(turbo)
+        self.turbo_delay_field.setEnabled(self.hold_check.isChecked())
+        self.loop_delay_label.setText("fire every:" if turbo else "loop delay:")
+
+    @guard
+    def loop_mode_changed(self, _index):
+        self.show_turbo_fields()
+        if self.loading:
+            return
+        # Turbo without its delays fires as fast as the daemon can loop, which
+        # is never what a turbo button means, so start from sensible values.
+        if self.loop_mode() == "turbo":
+            if not self.turbo_delay_field.text().strip():
+                self.turbo_delay_field.setText("500")
+            if not self.loop_delay_field.text().strip():
+                self.loop_delay_field.setText("50")
+        self.rebuild_output()
+
     @guard
     def toggle_hold(self, checked):
         self.loop_mode_combo.setEnabled(checked)
+        self.show_turbo_fields()
+        if checked and self.loop_mode() == "turbo":
+            self.loop_mode_changed(self.loop_mode_combo.currentIndex())
+            return
         self.rebuild_output()
 
     # ---------- mappings ----------
