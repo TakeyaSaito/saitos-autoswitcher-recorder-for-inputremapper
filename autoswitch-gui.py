@@ -361,6 +361,37 @@ def safe_preset_name(name):
 # assigned but does nothing".
 
 
+def input_nodes():
+    """Every /dev/input/event* node this user can read.
+
+    evdev.list_devices() is not used: it also demands *write* access, which
+    reading capabilities and recording never need. A read-only ACL (or a POSIX
+    named-user entry, which overrides the input group's rw) made it return
+    nothing, and every device then showed as "not connected".
+    """
+    nodes = sorted(Path("/dev/input").glob("event*"),
+                   key=lambda p: int(p.name[5:]) if p.name[5:].isdigit() else 0)
+    return [str(p) for p in nodes if os.access(p, os.R_OK)]
+
+
+def unreadable_input_names():
+    """Names of input devices that exist but this user can't open.
+
+    Taken from sysfs, which is world-readable, so a device can be told apart
+    from one that really is unplugged.
+    """
+    names = set()
+    for node in Path("/dev/input").glob("event*"):
+        if os.access(node, os.R_OK):
+            continue
+        try:
+            names.add((Path("/sys/class/input") / node.name / "device" / "name")
+                      .read_text().strip())
+        except OSError:
+            pass
+    return names
+
+
 def current_device_hashes():
     """{hash: {"name", "path", "codes", "count"}} for every live input device."""
     try:
@@ -370,7 +401,7 @@ def current_device_hashes():
     from hashlib import md5
 
     found = {}
-    for path in evdev.list_devices():
+    for path in input_nodes():
         try:
             device = evdev.InputDevice(path)
             capabilities = device.capabilities(absinfo=False)
@@ -2939,8 +2970,16 @@ class PresetEditor(QDialog):
             return
         nodes = device_nodes(self.device)
         if not nodes:
-            QMessageBox.warning(self, "Device not connected",
-                                f"“{self.device}” isn't connected right now.")
+            if self.device in unreadable_input_names():
+                QMessageBox.warning(
+                    self, "No permission to read device",
+                    f"“{self.device}” is plugged in, but you don't have "
+                    "permission to read it.<br><br>Add yourself to the "
+                    "<tt>input</tt> group (<tt>sudo usermod -aG input $USER</tt>) "
+                    "and log out and back in.")
+            else:
+                QMessageBox.warning(self, "Device not connected",
+                                    f"“{self.device}” isn't connected right now.")
             return
 
         self.pause_for_recording()
@@ -2983,7 +3022,7 @@ class PresetEditor(QDialog):
             return
         try:
             import evdev
-            sources = evdev.list_devices()
+            sources = input_nodes()
         except ImportError:
             sources = []
 
@@ -3015,7 +3054,7 @@ class PresetEditor(QDialog):
         # whose only mouse is the device they're editing.
         try:
             import evdev
-            sources = evdev.list_devices()
+            sources = input_nodes()
         except ImportError:
             sources = []
 
