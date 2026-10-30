@@ -1040,13 +1040,39 @@ def import_remapper():
     """Input Remapper's own config classes, or None when unavailable."""
     try:
         from inputremapper.configs.preset import Preset
-        from inputremapper.configs.mapping import UIMapping, KnownUinput, MappingType
+        from inputremapper.configs.mapping import KnownUinput, MappingType
         from inputremapper.configs.input_config import InputCombination, InputConfig
     except ImportError:
         return None
+    # input-remapper-git after 2.2.1.r11 merged the lax UIMapping into Mapping,
+    # swapped Preset's mapping_factory= for strict=, dropped Preset.__iter__ and
+    # replaced Mapping.get_error() with a list of readable strings. Support both.
+    try:
+        from inputremapper.configs.mapping import UIMapping
+    except ImportError:
+        try:
+            from inputremapper.configs.mapping import Mapping as UIMapping
+        except ImportError:
+            return None
+        new_preset = lambda path: Preset(path, strict=False)
+        preset_mappings = lambda preset: preset.get_mappings()
+
+        def mapping_problem(mapping):
+            return "; ".join(mapping.get_readable_strict_errors())
+    else:
+        new_preset = lambda path: Preset(path, mapping_factory=UIMapping)
+        preset_mappings = lambda preset: list(preset)
+
+        def mapping_problem(mapping):
+            error = mapping.get_error()
+            if not error:
+                return ""
+            lines = str(error).strip().splitlines()
+            return " ".join(line.strip() for line in lines[1:4]) or lines[0]
     return {"Preset": Preset, "UIMapping": UIMapping, "KnownUinput": KnownUinput,
             "MappingType": MappingType, "InputCombination": InputCombination,
-            "InputConfig": InputConfig}
+            "InputConfig": InputConfig, "new_preset": new_preset,
+            "preset_mappings": preset_mappings, "mapping_problem": mapping_problem}
 
 
 def device_nodes(device_name):
@@ -2741,9 +2767,9 @@ class PresetEditor(QDialog):
         path = PRESET_DIR / self.device / f"{preset}.json"
         self.mappings = []
         try:
-            loaded = self.api["Preset"](path, mapping_factory=self.api["UIMapping"])
+            loaded = self.api["new_preset"](path)
             loaded.load()
-            self.mappings = collapse_mirrored(list(loaded))
+            self.mappings = collapse_mirrored(self.api["preset_mappings"](loaded))
         except Exception as exc:
             self.error_label.setText(f"<span style='color:#d13438'>{exc}</span>")
         self.refresh_list()
@@ -2952,10 +2978,8 @@ class PresetEditor(QDialog):
                 "Map something in this preset to <tt>BTN_LEFT</tt> first.</span>")
             return
 
-        error = mapping.get_error()
-        if error:
-            first = str(error).strip().splitlines()
-            detail = " ".join(line.strip() for line in first[1:4]) or first[0]
+        detail = self.api["mapping_problem"](mapping)
+        if detail:
             self.error_label.setText(
                 f"<span style='color:#d13438'>⚠ {detail}</span>")
         else:
@@ -3242,7 +3266,7 @@ class PresetEditor(QDialog):
             answer = QMessageBox.question(
                 self, "Incomplete mappings",
                 f"{len(invalid)} mapping(s) are incomplete and will not be saved "
-                f"(first problem: {invalid[0].get_error()}).\n\nSave the rest?")
+                f"(first problem: {self.api['mapping_problem'](invalid[0])}).\n\nSave the rest?")
             if answer != QMessageBox.StandardButton.Yes:
                 return
 
@@ -3278,7 +3302,7 @@ class PresetEditor(QDialog):
 
         duplicates = []
         try:
-            preset = self.api["Preset"](path, mapping_factory=self.api["UIMapping"])
+            preset = self.api["new_preset"](path)
             # empty(), not clear() — clear() also drops Preset.path, after which
             # save() silently does nothing.
             preset.empty()
